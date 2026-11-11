@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = ["crates/hum-engine", "crates/hum-app", "crates/hum-tools"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.97"
+publish = false
+
+[workspace.dependencies]
+hum-engine = { path = "crates/hum-engine" }
+
+# The DSP must run in real time even in dev builds.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package.hum-engine]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4

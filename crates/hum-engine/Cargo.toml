@@ -1,0 +1,9 @@
+[package]
+name = "hum-engine"
+description = "Hum's pure-Rust synth engine: DSP, presets, scales, arpeggiator, sequencer, looper"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
