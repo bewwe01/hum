@@ -108,6 +108,9 @@ jobs:
 
       - name: Build the Rust library (arm64-v8a)
         run: |
+          export HUM_VERSION="dev-${GITHUB_SHA::7}"
+          # Android-only code is not covered by the host clippy job.
+          export RUSTFLAGS="-D warnings"
           cargo ndk --target arm64-v8a --platform "$ANDROID_MIN_SDK" \
             --output-dir android/app/src/main/jniLibs \
             build --package hum-app --lib --release --locked

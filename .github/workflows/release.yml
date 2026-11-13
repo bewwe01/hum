@@ -1,0 +1,199 @@
+name: Release
+
+# Builds, signs and publishes a release APK when a version tag is pushed:
+#   git tag v0.1.0 && git push origin v0.1.0
+# See docs/RELEASING.md for the one-time signing setup.
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  # Dry run: builds and signs with a throwaway key, uploads the APK as a
+  # workflow artifact and publishes nothing. Needs no secrets.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Keep in sync with android/gradle.properties and ci.yml.
+  ANDROID_NDK_VERSION: "27.3.13750724"
+  ANDROID_PLATFORM: "android-36"
+  ANDROID_BUILD_TOOLS: "36.0.0"
+  ANDROID_MIN_SDK: "26"
+  CARGO_NDK_VERSION: "4.1.2"
+
+jobs:
+  release:
+    name: Signed arm64 APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - name: Check that all signing secrets are set
+        if: github.event_name == 'push'
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          missing=0
+          for name in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Repository secret $name is not set. See docs/RELEASING.md."
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Derive the version from the tag
+        id: version
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if [ "$GITHUB_EVENT_NAME" != "push" ]; then
+            tag="v0.0.1"   # dry run
+          fi
+          if ! [[ "$tag" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "::error::Tag '$tag' must look like v1.2.3"
+            exit 1
+          fi
+          major="${BASH_REMATCH[1]}"; minor="${BASH_REMATCH[2]}"; patch="${BASH_REMATCH[3]}"
+          if [ "$minor" -gt 99 ] || [ "$patch" -gt 99 ]; then
+            echo "::error::minor and patch must be at most 99 (versionCode = major*10000 + minor*100 + patch)"
+            exit 1
+          fi
+          code=$((10#$major * 10000 + 10#$minor * 100 + 10#$patch))
+          if [ "$code" -lt 1 ]; then
+            echo "::error::versionCode must be at least 1 (v0.0.0 is not allowed)"
+            exit 1
+          fi
+          {
+            echo "tag=$tag"
+            echo "name=${tag#v}"
+            echo "code=$code"
+          } >> "$GITHUB_OUTPUT"
+          echo "versionName=${tag#v} versionCode=$code"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Select JDK 21
+        run: echo "JAVA_HOME=$JAVA_HOME_21_X64" >> "$GITHUB_ENV"
+
+      - name: Install the pinned Android SDK packages
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install \
+            "ndk;$ANDROID_NDK_VERSION" "platforms;$ANDROID_PLATFORM" "build-tools;$ANDROID_BUILD_TOOLS" > /dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
+          echo "BUILD_TOOLS=$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS" >> "$GITHUB_ENV"
+
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install && rustc --version
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked --version "$CARGO_NDK_VERSION"
+
+      - name: Build the Rust library (arm64-v8a, release)
+        env:
+          HUM_VERSION: ${{ steps.version.outputs.name }}
+        run: |
+          # Android-only code is not covered by the host clippy job.
+          export RUSTFLAGS="-D warnings"
+          cargo ndk --target arm64-v8a --platform "$ANDROID_MIN_SDK" \
+            --output-dir android/app/src/main/jniLibs \
+            build --package hum-app --lib --release --locked
+
+      - name: Assemble the unsigned release APK
+        working-directory: android
+        run: |
+          ./gradlew --no-daemon assembleRelease \
+            -PhumVersionName="${{ steps.version.outputs.name }}" \
+            -PhumVersionCode="${{ steps.version.outputs.code }}"
+
+      - name: Create a throwaway keystore (dry run only)
+        if: github.event_name != 'push'
+        run: |
+          pass="$(openssl rand -hex 16)"
+          echo "::add-mask::$pass"
+          keytool -genkeypair -keystore "$RUNNER_TEMP/hum-release.jks" -storetype PKCS12 \
+            -alias dryrun -keyalg RSA -keysize 2048 -validity 1 -dname "CN=Hum dry run" \
+            -storepass "$pass" -keypass "$pass" > /dev/null
+          {
+            echo "ANDROID_KEYSTORE_PASSWORD=$pass"
+            echo "ANDROID_KEY_PASSWORD=$pass"
+            echo "ANDROID_KEY_ALIAS=dryrun"
+          } >> "$GITHUB_ENV"
+
+      - name: Decode the signing keystore
+        if: github.event_name == 'push'
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          umask 077
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/hum-release.jks"
+
+      - name: Zipalign, sign and verify
+        env:
+          SECRET_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          SECRET_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          SECRET_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            export ANDROID_KEYSTORE_PASSWORD="$SECRET_KEYSTORE_PASSWORD"
+            export ANDROID_KEY_ALIAS="$SECRET_KEY_ALIAS"
+            export ANDROID_KEY_PASSWORD="$SECRET_KEY_PASSWORD"
+          fi
+          tag="${{ steps.version.outputs.tag }}"
+          mkdir -p dist
+          unsigned=android/app/build/outputs/apk/release/app-release-unsigned.apk
+          aligned="$RUNNER_TEMP/aligned.apk"
+          out="dist/hum-$tag-arm64-v8a.apk"
+          "$BUILD_TOOLS/zipalign" -p -f 4 "$unsigned" "$aligned"
+          "$BUILD_TOOLS/apksigner" sign \
+            --ks "$RUNNER_TEMP/hum-release.jks" \
+            --ks-pass env:ANDROID_KEYSTORE_PASSWORD \
+            --ks-key-alias "$ANDROID_KEY_ALIAS" \
+            --key-pass env:ANDROID_KEY_PASSWORD \
+            --out "$out" "$aligned"
+          "$BUILD_TOOLS/apksigner" verify --verbose --print-certs "$out" | grep -v -i "password"
+          (cd dist && sha256sum "hum-$tag-arm64-v8a.apk" > "hum-$tag-arm64-v8a.apk.sha256")
+          cat dist/*.sha256
+
+      - name: Check the APK (no permissions, arm64 only)
+        run: ./scripts/check-apk.sh "dist/hum-${{ steps.version.outputs.tag }}-arm64-v8a.apk"
+
+      - name: Upload the dry-run APK
+        if: github.event_name != 'push'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: hum-release-dry-run
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Create the GitHub release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.version.outputs.tag }}"
+          gh release create "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Hum $tag" \
+            --generate-notes \
+            --verify-tag \
+            "dist/hum-$tag-arm64-v8a.apk" \
+            "dist/hum-$tag-arm64-v8a.apk.sha256"
+
+      - name: Delete the decoded keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/hum-release.jks" "$RUNNER_TEMP/aligned.apk"

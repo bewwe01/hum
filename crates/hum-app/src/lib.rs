@@ -26,6 +26,7 @@ pub const VERSION: &str = match option_env!("HUM_VERSION") {
     None => env!("CARGO_PKG_VERSION"),
 };
 
+#[cfg(not(target_os = "android"))]
 use eframe::egui;
 use winit::application::ApplicationHandler;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
