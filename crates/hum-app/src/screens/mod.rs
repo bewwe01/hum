@@ -2,6 +2,7 @@
 
 mod beats;
 mod looper;
+pub use looper::layer_color;
 mod play;
 mod settings;
 mod sounds;

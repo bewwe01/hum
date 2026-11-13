@@ -1,6 +1,7 @@
 //! Sounds screen (spec section 3.3).
 
 use eframe::egui::{self, pos2, vec2, Align2, Id, Rect};
+use hum_engine::engine::Cmd;
 use hum_engine::presets::PRESETS;
 use hum_engine::Category;
 
@@ -39,14 +40,27 @@ impl HumApp {
             theme::TITLE,
             theme::TEXT,
         );
-        let count = format!("{} of {}", shown.len(), PRESETS.len());
+        let (count, color) = match self.assign_layer {
+            Some(slot) => (format!("For Layer {}", slot + 1), theme::AMBER),
+            None => (
+                format!("{} of {}", shown.len(), PRESETS.len()),
+                theme::MUTED,
+            ),
+        };
         theme::text(
             &p,
             pos2(rect.right(), y + 22.0),
             Align2::RIGHT_CENTER,
             &count,
-            inter(13.0, 400),
-            theme::MUTED,
+            inter(
+                13.0,
+                if self.assign_layer.is_some() {
+                    600
+                } else {
+                    400
+                },
+            ),
+            color,
         );
         y += 36.0 + GAP;
 
@@ -219,7 +233,9 @@ impl HumApp {
 
         let clip = p.with_clip_rect(rect);
         let w = (rect.width() - CARD_GAP) / 2.0;
-        let current = self.st.sound_index();
+        let current = self
+            .assigned_sound()
+            .unwrap_or_else(|| self.st.sound_index());
         let mut picked = None;
         for (n, &index) in shown.iter().enumerate() {
             let r = Rect::from_min_size(
@@ -290,15 +306,27 @@ impl HumApp {
             );
         }
         if let Some(index) = picked {
-            // Tapping a card selects it and plays a short preview note.
-            self.select_sound(index);
-            self.preview();
+            if let Some(slot) = self.assign_layer {
+                // Choosing a sound for a loop layer: hear it in the loop.
+                self.set_layer_sound(slot, index);
+                if !self.status.loop_on || !self.status.running {
+                    self.send(Cmd::LoopPlay(true));
+                }
+            } else {
+                // Tapping a card selects it and plays a short preview note.
+                self.select_sound(index);
+                self.preview();
+            }
         }
     }
 
     fn mini_player(&mut self, p: &egui::Painter, rect: Rect) {
         widgets::surface(p, rect, 24.0, theme::SURFACE, theme::LINE);
-        let preset = self.preset();
+        let assigning = self.assign_layer.is_some();
+        let preset = match self.assigned_sound() {
+            Some(index) => &PRESETS[index],
+            None => self.preset(),
+        };
         let play_c = pos2(rect.left() + 10.0 + 24.0, rect.center().y);
         let play = Rect::from_center_size(play_c, vec2(48.0, 48.0));
         let tap = self.touches.button(Id::unique("mini-play"), play);
@@ -306,7 +334,11 @@ impl HumApp {
         p.circle_filled(play_c, 24.0, widgets::pressed(theme::AMBER, tap.down));
         icons::play(p, play_c + vec2(1.0, 0.0), 24.0, theme::ON_AMBER);
         if tap.pressed {
-            self.preview();
+            if assigning {
+                self.send(Cmd::LoopPlay(true));
+            } else {
+                self.preview();
+            }
         }
 
         let use_w = 72.0;
@@ -326,12 +358,17 @@ impl HumApp {
             p,
             use_rect.center(),
             Align2::CENTER_CENTER,
-            "Use",
+            if assigning { "Done" } else { "Use" },
             inter(15.0, 600),
             theme::TEXT,
         );
         if tap.clicked {
-            self.tab = Tab::Play;
+            if assigning {
+                self.assign_layer = None;
+                self.tab = Tab::Loop;
+            } else {
+                self.tab = Tab::Play;
+            }
         }
 
         let x = play.right() + 12.0;
@@ -353,5 +390,11 @@ impl HumApp {
             inter(12.0, 400),
             theme::MUTED,
         );
+    }
+
+    /// The sound of the loop layer being edited, if any.
+    fn assigned_sound(&self) -> Option<usize> {
+        let layer = self.layer(self.assign_layer?)?;
+        hum_engine::presets::find(&layer.sound)
     }
 }

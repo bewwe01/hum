@@ -28,6 +28,8 @@ pub struct Macros {
     pub release: f32,
     /// Reverb send 0..1; negative = use the preset's own default.
     pub reverb: f32,
+    /// Part volume (loop layers), 1 = unchanged.
+    pub gain: f32,
 }
 
 impl Macros {
@@ -37,6 +39,7 @@ impl Macros {
         attack: 1.0,
         release: 1.0,
         reverb: -1.0,
+        gain: 1.0,
     };
 }
 
@@ -472,7 +475,7 @@ impl Voice {
             self.amp.trigger();
         }
 
-        let amp_target = lfo_amp * self.velocity * p.gain;
+        let amp_target = lfo_amp * self.velocity * p.gain * m.gain.clamp(0.0, 2.0);
         if self.amp_gain < 0.0 {
             self.amp_gain = amp_target;
         }

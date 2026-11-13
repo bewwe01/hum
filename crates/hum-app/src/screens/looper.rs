@@ -1,40 +1,32 @@
-//! Loop screen (spec section 3.4).
+//! Loop screen: the layer stack of the capture looper.
 
-use eframe::egui::{self, pos2, vec2, Align2, Color32, Id, Rect, Shape, Stroke};
-use hum_engine::engine::{Cmd, RecState, LAYERS};
-use hum_engine::presets::PRESETS;
-use hum_engine::transport::LOOP_STEPS;
+use eframe::egui::{self, pos2, vec2, Align2, Color32, Id, Painter, Rect, Shape, Stroke};
+use hum_engine::engine::{Cmd, LAYERS};
 
-use crate::app::{HumApp, Sheet};
+use crate::app::{HumApp, Sheet, Tab};
 use crate::icons;
-use crate::theme::{self, inter, GAP};
+use crate::theme::{self, grotesk, inter, GAP};
 use crate::widgets;
 
-/// Colour of each layer's notes and list dot.
+const ROW_H: f32 = 56.0;
+const ROW_GAP: f32 = 6.0;
+
+/// Colour of each layer's notes, dot and switch.
 pub fn layer_color(layer: usize) -> Color32 {
-    match layer {
-        0 => theme::VIOLET,
-        1 => theme::alpha(theme::VIOLET_LIGHT, 0.6),
-        2 => theme::alpha(theme::AMBER_LIGHT, 0.75),
-        _ => theme::alpha(theme::MUTED, 0.9),
-    }
+    const COLORS: [Color32; 8] = [
+        Color32::from_rgb(0xA7, 0x8B, 0xFA),
+        Color32::from_rgb(0xFF, 0xB5, 0x47),
+        Color32::from_rgb(0x5E, 0xD3, 0xB3),
+        Color32::from_rgb(0xF4, 0x72, 0xB6),
+        Color32::from_rgb(0x60, 0xA5, 0xFA),
+        Color32::from_rgb(0xC4, 0xB5, 0xFD),
+        Color32::from_rgb(0xFF, 0xD9, 0xA0),
+        Color32::from_rgb(0xA3, 0xE6, 0x35),
+    ];
+    COLORS[layer % COLORS.len()]
 }
 
 impl HumApp {
-    fn layer_filled(&self, layer: usize) -> bool {
-        self.status.layers >> layer & 1 == 1
-    }
-
-    fn recording_layer(&self) -> Option<usize> {
-        (self.status.rec != RecState::Idle).then_some(self.status.rec_layer)
-    }
-
-    fn clear_layer(&mut self, layer: usize) {
-        self.send(Cmd::ClearLayer(layer as u8));
-        self.layers[layer].notes.clear();
-        self.rec_order.retain(|l| *l != layer);
-    }
-
     pub(crate) fn loop_screen(&mut self, ui: &mut egui::Ui, rect: Rect) {
         let p = ui.painter().clone();
         let mut y = rect.top();
@@ -81,61 +73,49 @@ impl HumApp {
         self.bpm_pill(&p, rect.right() - 44.0 - 8.0, y + 22.0);
         y += 44.0 + GAP;
 
-        // ---- vertical budget ------------------------------------------------
-        let list_h = LAYERS as f32 * 52.0 + (LAYERS - 1) as f32 * 8.0;
-        let fixed = GAP + list_h + GAP + 72.0 + GAP + 96.0;
-        let timeline_h = (rect.bottom() - y - fixed).clamp(110.0, 176.0);
-
-        self.timeline(
-            &p,
-            Rect::from_min_size(pos2(rect.left(), y), vec2(rect.width(), timeline_h)),
+        // ---- layout ----------------------------------------------------------
+        let keys_h = (rect.height() * 0.15).clamp(80.0, 120.0);
+        let transport_h = 72.0;
+        let timeline_h = 128.0;
+        let keys = Rect::from_min_max(pos2(rect.left(), rect.bottom() - keys_h), rect.max);
+        let transport = Rect::from_min_size(
+            pos2(rect.left(), keys.top() - GAP - transport_h),
+            vec2(rect.width(), transport_h),
         );
-        y += timeline_h + GAP;
-
-        for layer in 0..LAYERS {
-            let row = Rect::from_min_size(pos2(rect.left(), y), vec2(rect.width(), 52.0));
-            self.layer_row(&p, row, layer);
-            y += 52.0 + 8.0;
-        }
-        y += GAP - 8.0;
-
-        self.loop_transport(
-            &p,
-            Rect::from_min_size(pos2(rect.left(), y), vec2(rect.width(), 72.0)),
+        let timeline = Rect::from_min_size(pos2(rect.left(), y), vec2(rect.width(), timeline_h));
+        let list = Rect::from_min_max(
+            pos2(rect.left(), timeline.bottom() + GAP),
+            pos2(rect.right(), transport.top() - GAP),
         );
-        y += 72.0 + GAP;
 
-        // ---- compact keyboard ------------------------------------------------
-        let keys = Rect::from_min_max(pos2(rect.left(), y), rect.max);
-        if keys.height() >= 40.0 {
-            self.keyboard(&p, keys, false);
-        }
+        self.timeline(&p, timeline);
+        self.layer_list(ui, &p, list);
+        self.loop_transport(&p, transport);
+        self.keyboard(&p, keys, false);
     }
 
-    fn timeline(&mut self, p: &egui::Painter, rect: Rect) {
-        widgets::surface(p, rect, 26.0, theme::SURFACE, theme::LINE);
+    fn timeline(&mut self, p: &Painter, rect: Rect) {
+        widgets::surface(p, rect, 24.0, theme::SURFACE, theme::LINE);
         let inner = rect.shrink(14.0);
         let status = self.status;
-        let pos = status.pos;
-        let layers_any = status.layers != 0;
+        let steps = self.st.looper.as_ref().map_or(64, |l| l.steps);
+        let count = self.st.looper.as_ref().map_or(0, |l| l.count());
+        let playing = status.running && status.loop_on && count > 0;
 
-        // Status line.
-        let (dot, text) = match status.rec {
-            RecState::CountIn => (theme::AMBER, "Count-in: get ready".to_owned()),
-            RecState::Recording => (
+        let (dot, text) = if count == 0 {
+            (theme::MUTED, "Play something, then tap Loop".to_owned())
+        } else if playing {
+            (
                 theme::AMBER,
-                format!("Recording layer {}", status.rec_layer + 1),
-            ),
-            RecState::Idle if status.running && status.loop_on && layers_any => {
-                (theme::VIOLET, "Playing".to_owned())
-            }
-            RecState::Idle if status.layers == 0b1111 => {
-                (theme::MUTED, "All 4 layers are full".to_owned())
-            }
-            RecState::Idle if layers_any => (theme::MUTED, "Stopped".to_owned()),
-            RecState::Idle => (theme::MUTED, "Tap record to start".to_owned()),
+                format!(
+                    "Playing · {count} layer{}",
+                    if count == 1 { "" } else { "s" }
+                ),
+            )
+        } else {
+            (theme::MUTED, "Paused".to_owned())
         };
-        let line_y = inner.top() + 10.0;
+        let line_y = inner.top() + 8.0;
         p.circle_filled(pos2(inner.left() + 5.0, line_y), 5.0, dot);
         theme::text(
             p,
@@ -145,57 +125,26 @@ impl HumApp {
             inter(14.0, 600),
             theme::TEXT,
         );
-        let where_text = if !status.running {
-            "4 bars".to_owned()
-        } else if pos < 0.0 {
-            format!(
-                "Count-in · Beat {}",
-                ((pos + 16.0) / 4.0).floor().clamp(0.0, 3.0) as i32 + 1
-            )
-        } else {
-            format!(
-                "Bar {} · Beat {}",
-                (pos / 16.0).floor() as i32 % 4 + 1,
-                ((pos % 16.0) / 4.0).floor() as i32 + 1
-            )
-        };
-        theme::text(
-            p,
-            pos2(inner.right(), line_y),
-            Align2::RIGHT_CENTER,
-            &where_text,
-            inter(12.0, 400),
-            theme::MUTED,
-        );
-
-        // Bar labels.
-        let labels_y = inner.top() + 20.0 + 8.0;
-        let area = Rect::from_min_max(pos2(inner.left(), labels_y + 16.0 + 6.0), inner.max);
-        let bar_w = area.width() / 4.0;
-        let current_bar = if status.running && pos >= 0.0 {
-            Some((pos / 16.0).floor() as usize % 4)
-        } else {
-            None
-        };
-        for bar in 0..4 {
-            let (style, color) = if current_bar == Some(bar) {
-                (inter(12.0, 600), theme::AMBER)
-            } else {
-                (inter(12.0, 400), theme::MUTED)
-            };
+        if count > 0 {
+            let bars = usize::from(steps) / 16;
+            let info = format!(
+                "{bars} bar{} · {} BPM",
+                if bars == 1 { "" } else { "s" },
+                self.st.bpm.round() as i32
+            );
             theme::text(
                 p,
-                pos2(area.left() + bar as f32 * bar_w, labels_y),
-                Align2::LEFT_TOP,
-                &format!("Bar {}", bar + 1),
-                style,
-                color,
+                pos2(inner.right(), line_y),
+                Align2::RIGHT_CENTER,
+                &info,
+                inter(12.0, 400),
+                theme::MUTED,
             );
         }
 
-        // Grid: beat lines and bar lines.
-        for beat in 0..=16 {
-            let x = area.left() + area.width() * beat as f32 / 16.0;
+        let area = Rect::from_min_max(pos2(inner.left(), inner.top() + 24.0), inner.max);
+        for beat in 0..=(usize::from(steps) / 4) {
+            let x = area.left() + area.width() * (beat * 4) as f32 / f32::from(steps);
             let color = if beat % 4 == 0 {
                 theme::BAR_LINE
             } else {
@@ -206,61 +155,48 @@ impl HumApp {
                 Stroke::new(1.0, color),
             );
         }
-
-        // Notes. Pitch decides the row; all layers share one pitch range.
+        let Some(looper) = &self.st.looper else {
+            return;
+        };
         let (mut lo, mut hi) = (127u8, 0u8);
-        for layer in &self.layers {
-            for n in &layer.notes {
-                lo = lo.min(n.note);
-                hi = hi.max(n.note);
-            }
+        for n in looper.layers.iter().flatten().flat_map(|l| l.notes.iter()) {
+            lo = lo.min(n.note);
+            hi = hi.max(n.note);
         }
         let span = f32::from(hi.saturating_sub(lo).max(7));
-        let lane = area.shrink2(vec2(0.0, 4.0));
-        let x_of = |t: f32| lane.left() + lane.width() * (t / LOOP_STEPS as f32).clamp(0.0, 1.0);
+        let lane = area.shrink2(vec2(0.0, 3.0));
+        let x_of = |t: f32| lane.left() + lane.width() * (t / f32::from(steps)).clamp(0.0, 1.0);
         let clip = p.with_clip_rect(area);
-        for (index, layer) in self.layers.iter().enumerate() {
-            let recording = self.recording_layer() == Some(index);
-            if !self.layer_filled(index) && !recording {
-                continue;
-            }
-            let mut color = layer_color(index);
-            if status.muted >> index & 1 == 1 {
-                color = theme::alpha(theme::MUTED, 0.3);
-            }
+        for (slot, layer) in looper.layers.iter().enumerate() {
+            let Some(layer) = layer else { continue };
+            let color = if layer.muted {
+                theme::alpha(theme::MUTED, 0.25)
+            } else {
+                layer_color(slot)
+            };
             for n in &layer.notes {
                 let y = lane.bottom()
-                    - 9.0
-                    - (lane.height() - 9.0) * f32::from(n.note.saturating_sub(lo)) / span;
-                // A note still being held grows up to the playhead.
-                let end = n.end.unwrap_or(if recording {
-                    pos.rem_euclid(LOOP_STEPS as f32)
+                    - 6.0
+                    - (lane.height() - 6.0) * f32::from(n.note.saturating_sub(lo)) / span;
+                let segments: [(f32, f32); 2] = if n.off >= n.on {
+                    [(n.on, n.off), (0.0, 0.0)]
                 } else {
-                    n.start + 0.5
-                });
-                let mut segments = [(n.start, end), (0.0, 0.0)];
-                if end < n.start {
-                    // The note crosses the loop point.
-                    segments = [(n.start, LOOP_STEPS as f32), (0.0, end)];
-                }
+                    [(n.on, f32::from(steps)), (0.0, n.off)]
+                };
                 for (a, b) in segments {
-                    if b <= a && !(a == n.start && b == end) {
-                        continue;
+                    if b > a {
+                        let x0 = x_of(a);
+                        clip.rect_filled(
+                            Rect::from_min_max(pos2(x0, y), pos2(x_of(b).max(x0 + 3.0), y + 6.0)),
+                            3.0,
+                            color,
+                        );
                     }
-                    let x0 = x_of(a);
-                    let x1 = x_of(b).max(x0 + 4.0);
-                    clip.rect_filled(
-                        Rect::from_min_max(pos2(x0, y), pos2(x1, y + 9.0)),
-                        4.5,
-                        color,
-                    );
                 }
             }
         }
-
-        // Playhead.
         if status.running {
-            let x = x_of(pos.max(0.0));
+            let x = x_of(status.pos.max(0.0));
             p.line_segment(
                 [pos2(x, area.top() - 2.0), pos2(x, area.bottom())],
                 Stroke::new(2.0, theme::AMBER),
@@ -274,115 +210,226 @@ impl HumApp {
         }
     }
 
-    fn layer_row(&mut self, p: &egui::Painter, row: Rect, layer: usize) {
-        let armed = self.recording_layer() == Some(layer);
-        let filled = self.layer_filled(layer);
-        let dot = pos2(row.left() + 16.0 + 5.0, row.center().y);
-        let text_x = dot.x + 5.0 + 12.0;
-        if armed {
-            widgets::surface(p, row, 18.0, theme::SURFACE_3, theme::AMBER);
-            p.circle_filled(dot, 5.0, theme::AMBER);
-            let sound = PRESETS[self.layers[layer].sound.min(PRESETS.len() - 1)].name;
-            let text = if self.status.rec == RecState::CountIn {
-                format!("Get ready to record with {sound}")
-            } else {
-                format!("Play now to record with {sound}")
-            };
-            let text = theme::fit(p, &text, inter(14.0, 600), row.right() - 14.0 - text_x);
+    fn layer_list(&mut self, ui: &egui::Ui, p: &Painter, rect: Rect) {
+        let slots: Vec<usize> = (0..LAYERS).filter(|&s| self.layer(s).is_some()).collect();
+        if slots.is_empty() {
+            widgets::dashed_round_rect(
+                p,
+                Rect::from_min_size(rect.min, vec2(rect.width(), ROW_H)),
+                18.0,
+                Stroke::new(1.0, theme::DASHED_EMPTY),
+            );
+            let hint = "Your layers appear here. Each Loop tap adds one.";
             theme::text(
                 p,
-                pos2(text_x, row.center().y),
+                pos2(rect.left() + 16.0, rect.top() + ROW_H / 2.0),
                 Align2::LEFT_CENTER,
-                &text,
-                inter(14.0, 600),
-                theme::TEXT,
-            );
-        } else if filled {
-            let muted = self.status.muted >> layer & 1 == 1;
-            widgets::surface(p, row, 18.0, theme::SURFACE, theme::LINE);
-            p.circle_filled(dot, 5.0, layer_color(layer));
-            let name_color = if muted { theme::MUTED } else { theme::TEXT };
-            theme::text(
-                p,
-                pos2(text_x, row.center().y - 1.0),
-                Align2::LEFT_BOTTOM,
-                &format!("Layer {}", layer + 1),
-                inter(14.0, 600),
-                name_color,
-            );
-            let sound = PRESETS[self.layers[layer].sound.min(PRESETS.len() - 1)].name;
-            let caption = if muted {
-                format!("{sound} · muted")
-            } else {
-                sound.to_owned()
-            };
-            theme::text(
-                p,
-                pos2(text_x, row.center().y + 2.0),
-                Align2::LEFT_TOP,
-                &caption,
-                inter(12.0, 400),
+                hint,
+                inter(13.0, 500),
                 theme::MUTED,
             );
-
-            let clear = Rect::from_min_size(
-                pos2(row.right() - 4.0 - 44.0, row.top() + 4.0),
-                vec2(44.0, 44.0),
+            return;
+        }
+        // Vertical scrolling when the rows do not fit.
+        let id = Id::unique("layer-list");
+        self.touches.claim(id, rect);
+        let content = slots.len() as f32 * (ROW_H + ROW_GAP) - ROW_GAP;
+        let max_scroll = (content - rect.height()).max(0.0);
+        let scroll_id = Id::unique("layer-scroll");
+        let mut scroll: f32 = ui.data(|d| d.get_temp(scroll_id)).unwrap_or(0.0);
+        for t in self.touches.owned(id) {
+            if !t.ended && t.travel > crate::input::TAP_SLOP {
+                scroll -= t.delta().y;
+            }
+        }
+        if ui.rect_contains_pointer(rect) {
+            scroll -= ui.input(|i| i.smooth_scroll_delta.y);
+        }
+        scroll = scroll.clamp(0.0, max_scroll);
+        ui.data_mut(|d| d.insert_temp(scroll_id, scroll));
+        let clip = p.with_clip_rect(rect);
+        for (i, &slot) in slots.iter().enumerate() {
+            let row = Rect::from_min_size(
+                pos2(
+                    rect.left(),
+                    rect.top() - scroll + i as f32 * (ROW_H + ROW_GAP),
+                ),
+                vec2(rect.width(), ROW_H),
             );
-            let mute =
-                Rect::from_min_size(pos2(clear.left() - 44.0, row.top() + 4.0), vec2(44.0, 44.0));
-            let tap = self.touches.button(Id::unique(("layer-mute", layer)), mute);
-            if tap.down {
-                p.circle_filled(mute.center(), 20.0, theme::SURFACE_2);
+            if row.bottom() < rect.top() || row.top() > rect.bottom() {
+                continue;
             }
-            icons::speaker(
-                p,
-                mute.center(),
-                24.0,
-                if muted { theme::AMBER } else { theme::TEXT },
-                muted,
-            );
-            if tap.clicked {
-                self.send(Cmd::MuteLayer {
-                    layer: layer as u8,
-                    muted: !muted,
-                });
-            }
-            let tap = self
-                .touches
-                .button(Id::unique(("layer-clear", layer)), clear);
-            if tap.down {
-                p.circle_filled(clear.center(), 20.0, theme::SURFACE_2);
-            }
-            icons::trash(p, clear.center(), 24.0, theme::MUTED);
-            if tap.clicked {
-                self.clear_layer(layer);
-            }
-        } else {
-            widgets::dashed_round_rect(p, row, 18.0, Stroke::new(1.0, theme::DASHED_EMPTY));
-            p.circle_stroke(dot, 4.5, Stroke::new(1.0, theme::DASHED_EMPTY));
-            theme::text(
-                p,
-                pos2(text_x, row.center().y),
-                Align2::LEFT_CENTER,
-                "Empty",
-                inter(14.0, 500),
-                theme::MUTED,
-            );
+            self.layer_row(&clip, row, rect, slot);
         }
     }
 
-    fn loop_transport(&mut self, p: &egui::Painter, rect: Rect) {
-        let cy = rect.center().y;
-        let total = 56.0 + 16.0 + 72.0 + 16.0 + 56.0 + 16.0 + 56.0;
-        let mut x = rect.center().x - total * 0.5;
-        let recording = self.status.rec != RecState::Idle;
-        let any_layers = self.status.layers != 0;
-        let full = self.status.layers == 0b1111;
+    fn layer_row(&mut self, p: &Painter, row: Rect, visible: Rect, slot: usize) {
+        let Some(layer) = self.layer(slot).cloned() else {
+            return;
+        };
+        let color = layer_color(slot);
+        widgets::surface(p, row, 18.0, theme::SURFACE, theme::LINE);
+        let hit = |r: Rect| r.intersect(visible);
 
-        // Undo: removes the last recorded layer (or cancels the current take).
+        // On/off switch, tinted with the layer colour.
+        let switch = Rect::from_min_size(pos2(row.left() + 6.0, row.top() + 6.0), vec2(56.0, 44.0));
+        let tap = self
+            .touches
+            .button(Id::unique(("layer-on", slot)), hit(switch));
+        let on = !layer.muted;
+        let track = Rect::from_center_size(switch.center(), vec2(44.0, 26.0));
+        p.rect_filled(track, 13.0, if on { color } else { theme::LINE });
+        let knob_x = if on {
+            track.right() - 13.0
+        } else {
+            track.left() + 13.0
+        };
+        p.circle_filled(
+            pos2(knob_x, track.center().y),
+            10.0,
+            if on { theme::TEXT } else { theme::MUTED },
+        );
+        if tap.clicked {
+            self.toggle_layer(slot);
+        }
+
+        // Buttons on the right: tidy timing, delete.
+        let trash = Rect::from_min_size(
+            pos2(row.right() - 4.0 - 40.0, row.top() + 6.0),
+            vec2(40.0, 44.0),
+        );
+        let tidy =
+            Rect::from_min_size(pos2(trash.left() - 40.0, row.top() + 6.0), vec2(40.0, 44.0));
+        let tap = self
+            .touches
+            .button(Id::unique(("layer-tidy", slot)), hit(tidy));
+        if layer.tidy {
+            p.rect_filled(
+                Rect::from_center_size(tidy.center(), vec2(34.0, 30.0)),
+                10.0,
+                theme::SURFACE_3,
+            );
+        }
+        icons::grid(
+            p,
+            tidy.center(),
+            20.0,
+            if layer.tidy {
+                theme::VIOLET
+            } else {
+                theme::MUTED
+            },
+        );
+        if tap.clicked {
+            self.toggle_tidy(slot);
+            self.show_toast(if layer.tidy {
+                "Tidy timing off"
+            } else {
+                "Tidy timing on: notes snap to the beat"
+            });
+        }
+        let tap = self
+            .touches
+            .button(Id::unique(("layer-delete", slot)), hit(trash));
+        icons::trash(
+            p,
+            trash.center(),
+            22.0,
+            if tap.down { theme::TEXT } else { theme::MUTED },
+        );
+        if tap.clicked {
+            self.delete_layer(slot);
+            self.show_toast("Layer deleted (Redo brings it back)");
+        }
+
+        // Volume slider.
+        let slider = Rect::from_min_max(
+            pos2(tidy.left() - 76.0, row.top()),
+            pos2(tidy.left() - 6.0, row.bottom()),
+        );
+        let id = Id::unique(("layer-volume", slot));
+        self.touches.claim(id, hit(slider));
+        let drag: Option<f32> = self
+            .touches
+            .owned(id)
+            .filter(|t| !t.ended)
+            .last()
+            .map(|t| t.pos.x);
+        if let Some(x) = drag {
+            self.set_layer_volume(slot, (x - slider.left() - 6.0) / (slider.width() - 12.0));
+        }
+        let volume = self.layer(slot).map_or(1.0, |l| l.volume);
+        let (x0, x1, cy) = (
+            slider.left() + 6.0,
+            slider.right() - 6.0,
+            slider.center().y + 9.0,
+        );
+        p.line_segment([pos2(x0, cy), pos2(x1, cy)], Stroke::new(4.0, theme::LINE));
+        let xv = x0 + (x1 - x0) * volume;
+        p.line_segment(
+            [pos2(x0, cy), pos2(xv, cy)],
+            Stroke::new(4.0, if on { color } else { theme::MUTED }),
+        );
+        p.circle_filled(pos2(xv, cy), 7.0, theme::TEXT);
+        theme::text(
+            p,
+            pos2(slider.center().x, row.top() + 15.0),
+            Align2::CENTER_CENTER,
+            "Volume",
+            inter(11.0, 500),
+            theme::MUTED,
+        );
+
+        // Name and sound; tapping chooses another sound for this layer.
+        let text = Rect::from_min_max(
+            pos2(switch.right() + 4.0, row.top()),
+            pos2(slider.left() - 4.0, row.bottom()),
+        );
+        let tap = self
+            .touches
+            .button(Id::unique(("layer-sound", slot)), hit(text));
+        if tap.down {
+            p.rect_filled(text.shrink2(vec2(0.0, 4.0)), 10.0, theme::SURFACE_2);
+        }
+        let name_color = if on { theme::TEXT } else { theme::MUTED };
+        theme::text(
+            p,
+            pos2(text.left() + 6.0, row.center().y - 1.0),
+            Align2::LEFT_BOTTOM,
+            &format!("Layer {}", slot + 1),
+            inter(14.0, 600),
+            name_color,
+        );
+        let sound = theme::fit(
+            p,
+            &format!("{} ›", layer.sound),
+            inter(12.0, 400),
+            text.width() - 8.0,
+        );
+        theme::text(
+            p,
+            pos2(text.left() + 6.0, row.center().y + 2.0),
+            Align2::LEFT_TOP,
+            &sound,
+            inter(12.0, 400),
+            theme::MUTED,
+        );
+        if tap.clicked {
+            self.assign_layer = Some(slot);
+            self.tab = Tab::Sounds;
+        }
+    }
+
+    fn loop_transport(&mut self, p: &Painter, rect: Rect) {
+        let cy = rect.center().y;
+        let gap = 10.0;
+        let total = 56.0 * 4.0 + 72.0 + gap * 4.0;
+        let mut x = rect.center().x - total * 0.5;
+        let playing = self.status.loop_on && self.status.running;
+        let has_layers = self.can_undo();
+
+        // Undo.
         let c = pos2(x + 28.0, cy);
-        let can_undo = recording || self.rec_order.iter().any(|l| self.layer_filled(*l));
         let tap = self.touches.button(
             Id::unique("loop-undo"),
             Rect::from_center_size(c, vec2(56.0, 56.0)),
@@ -391,75 +438,52 @@ impl HumApp {
             p,
             c,
             28.0,
-            widgets::pressed(theme::SURFACE, tap.down && can_undo),
+            widgets::pressed(theme::SURFACE, tap.down && has_layers),
             theme::LINE,
         );
         icons::undo(
             p,
             c,
             24.0,
-            if can_undo {
+            if has_layers {
                 theme::TEXT
             } else {
                 theme::alpha(theme::MUTED, 0.45)
             },
         );
-        if tap.clicked {
-            if let Some(layer) = self.recording_layer() {
-                self.clear_layer(layer);
-            } else {
-                while let Some(layer) = self.rec_order.pop() {
-                    if self.layer_filled(layer) {
-                        self.clear_layer(layer);
-                        break;
-                    }
-                }
-            }
+        if tap.clicked && has_layers {
+            self.undo();
         }
-        x += 56.0 + 16.0;
+        x += 56.0 + gap;
 
-        // Record.
+        // Loop (capture).
         let c = pos2(x + 36.0, cy);
-        let tap = self.touches.button(
-            Id::unique("loop-record"),
-            Rect::from_center_size(c, vec2(72.0, 72.0)),
-        );
-        let enabled = recording || !full;
-        let fill = if enabled {
-            theme::AMBER
-        } else {
-            theme::alpha(theme::AMBER, 0.35)
-        };
-        if enabled {
-            widgets::glow_circle(
-                p,
-                c,
-                36.0,
-                theme::alpha(theme::AMBER, if recording { 0.45 } else { 0.35 }),
-                28.0,
-            );
-        }
-        p.circle_filled(c, 36.0, theme::AMBER_LIGHT);
-        p.circle_filled(c, 32.0, widgets::pressed(fill, tap.down));
-        if recording {
-            icons::stop(p, c, 40.0, theme::ON_AMBER);
-        } else {
-            p.circle_filled(c, 9.0, theme::ON_AMBER);
-        }
-        if tap.clicked {
-            if recording {
-                self.send(Cmd::RecordStop);
-            } else if let Some(slot) = (0..LAYERS).find(|l| !self.layer_filled(*l)) {
-                self.layers[slot].notes.clear();
-                self.layers[slot].sound = self.st.sound_index();
-                self.send(Cmd::RecordStart);
-            }
-        }
-        x += 72.0 + 16.0;
+        self.loop_button(p, c, 36.0, "loop-capture");
+        x += 72.0 + gap;
 
-        // Play / stop the loop.
+        // Redo.
         let c = pos2(x + 28.0, cy);
-        let playing = self.status.loop_on && self.status.running;
+        let can_redo = !self.redo.is_empty();
+        let tap = self.touches.button(
+            Id::unique("loop-redo"),
+            Rect::from_center_size(c, vec2(56.0, 56.0)),
+        );
+        widgets::circle(
+            p,
+            c,
+            28.0,
+            widgets::pressed(theme::SURFACE, tap.down && can_redo),
+            theme::LINE,
+        );
+        let dim = theme::alpha(theme::MUTED, 0.45);
+        icons::redo(p, c, 24.0, if can_redo { theme::TEXT } else { dim });
+        if tap.clicked && can_redo {
+            self.redo();
+        }
+        x += 56.0 + gap;
+
+        // Play / pause.
+        let c = pos2(x + 28.0, cy);
         let tap = self.touches.button(
             Id::unique("loop-play"),
             Rect::from_center_size(c, vec2(56.0, 56.0)),
@@ -472,18 +496,22 @@ impl HumApp {
             if playing { theme::VIOLET } else { theme::LINE },
         );
         if playing {
-            icons::stop(p, c, 28.0, theme::TEXT);
+            icons::pause(p, c, 26.0, theme::TEXT);
         } else {
-            icons::play(p, c + vec2(1.5, 0.0), 26.0, theme::TEXT);
+            icons::play(
+                p,
+                c + vec2(1.5, 0.0),
+                26.0,
+                if has_layers { theme::TEXT } else { dim },
+            );
         }
-        if tap.clicked {
+        if tap.clicked && has_layers {
             self.send(Cmd::LoopPlay(!playing));
         }
-        x += 56.0 + 16.0;
+        x += 56.0 + gap;
 
         // Clear all (asks first).
         let c = pos2(x + 28.0, cy);
-        let can_clear = any_layers || recording;
         let tap = self.touches.button(
             Id::unique("loop-clear-all"),
             Rect::from_center_size(c, vec2(56.0, 56.0)),
@@ -492,21 +520,35 @@ impl HumApp {
             p,
             c,
             28.0,
-            widgets::pressed(theme::SURFACE, tap.down && can_clear),
+            widgets::pressed(theme::SURFACE, tap.down && has_layers),
             theme::LINE,
         );
-        icons::trash(
-            p,
-            c,
-            24.0,
-            if can_clear {
-                theme::TEXT
-            } else {
-                theme::alpha(theme::MUTED, 0.45)
-            },
-        );
-        if tap.clicked && can_clear {
+        icons::trash(p, c, 24.0, if has_layers { theme::TEXT } else { dim });
+        if tap.clicked && has_layers {
             self.sheet = Some(Sheet::ConfirmClearAll);
+        }
+    }
+
+    /// The big amber Loop button (used on the Play and Loop screens).
+    pub(crate) fn loop_button(&mut self, p: &Painter, c: egui::Pos2, r: f32, id: &'static str) {
+        let tap = self.touches.button(
+            Id::unique(id),
+            Rect::from_center_size(c, vec2(r * 2.0, r * 2.0)),
+        );
+        widgets::glow_circle(p, c, r, theme::alpha(theme::AMBER, 0.35), 24.0);
+        p.circle_filled(c, r, theme::AMBER_LIGHT);
+        p.circle_filled(c, r - 3.5, widgets::pressed(theme::AMBER, tap.down));
+        icons::loop_arrows(p, c - vec2(0.0, r * 0.18), r * 0.62, theme::ON_AMBER);
+        theme::text(
+            p,
+            c + vec2(0.0, r * 0.45),
+            Align2::CENTER_CENTER,
+            "Loop",
+            grotesk(r * 0.36, 700),
+            theme::ON_AMBER,
+        );
+        if tap.pressed {
+            self.capture();
         }
     }
 }

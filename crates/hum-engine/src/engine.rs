@@ -15,13 +15,25 @@ use crate::fx::{Chorus, Delay, Limiter, Reverb};
 use crate::preset::{ArpPattern, Preset};
 use crate::presets::{self, PRESETS};
 use crate::scale::KeyMap;
-use crate::transport::{Transport, DEFAULT_PATTERNS, DRUMS, LOOP_STEPS, STEPS_PER_BAR};
+use crate::transport::{
+    Transport, DEFAULT_PATTERNS, DRUMS, LOOP_STEPS, MAX_BPM, MIN_BPM, STEPS_PER_BAR,
+};
 use crate::voice::{BlockCtx, Buses, Macros, Voice, MAX_BLOCK};
 
 pub const VOICES: usize = 24;
-pub const LAYERS: usize = 4;
+pub const LAYERS: usize = 8;
 /// Maximum number of events (note-ons plus note-offs) in one loop layer.
 pub const LAYER_CAPACITY: usize = 1024;
+/// Live note events remembered for capturing (on and off).
+const HISTORY: usize = 4096;
+/// A first loop must last between these many seconds.
+pub const MIN_LOOP_SECONDS: f64 = 1.5;
+pub const MAX_LOOP_SECONDS: f64 = 32.0;
+/// A pause longer than this ends the phrase that the first capture takes.
+const PHRASE_GAP_SECONDS: f64 = 3.0;
+/// Inferred tempo aims for this BPM.
+const TARGET_BPM: f64 = 110.0;
+const NO_LOOP_STEPS: u32 = LOOP_STEPS as u32;
 /// On-screen keys, plus one virtual key used for previews.
 pub const KEYS: usize = 7;
 const PREVIEW_KEY: usize = KEYS;
@@ -99,13 +111,6 @@ impl AtomicF32 {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum RecState {
-    Idle,
-    CountIn,
-    Recording,
-}
-
 /// A snapshot of the transport / looper state for the UI.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Status {
@@ -113,14 +118,15 @@ pub struct Status {
     pub beat_on: bool,
     pub loop_on: bool,
     pub metronome: bool,
-    pub rec: RecState,
-    /// The layer being recorded (valid unless `rec` is `Idle`).
-    pub rec_layer: usize,
-    /// Bit i = layer i holds a recording.
+    /// A loop length has been set (by the first capture or a load).
+    pub has_loop: bool,
+    /// Bit i = layer i holds notes.
     pub layers: u8,
     /// Bit i = layer i is muted.
     pub muted: u8,
-    /// Playhead in sixteenth steps, 0..64 (negative during the count-in).
+    /// Loop length in sixteenth steps (64 when there is no loop).
+    pub loop_steps: u32,
+    /// Playhead in sixteenth steps, 0..loop_steps.
     pub pos: f32,
     /// Current step, or -1 when stopped.
     pub step: i32,
@@ -139,6 +145,7 @@ pub struct Shared {
     pub volume: AtomicF32,
     // audio -> UI: status.
     flags: AtomicU32,
+    loop_steps: AtomicU32,
     pos: AtomicF32,
     step: AtomicI32,
     voices: AtomicU32,
@@ -154,6 +161,7 @@ impl Default for Shared {
             reverb: AtomicF32::new(PRESETS[presets::DEFAULT_PRESET].reverb),
             volume: AtomicF32::new(VOLUME_DEFAULT),
             flags: AtomicU32::new(0),
+            loop_steps: AtomicU32::new(NO_LOOP_STEPS),
             pos: AtomicF32::new(0.0),
             step: AtomicI32::new(-1),
             voices: AtomicU32::new(0),
@@ -169,14 +177,10 @@ impl Shared {
             beat_on: f & 2 != 0,
             loop_on: f & 4 != 0,
             metronome: f & 8 != 0,
-            rec: match (f >> 4) & 3 {
-                1 => RecState::CountIn,
-                2 => RecState::Recording,
-                _ => RecState::Idle,
-            },
-            rec_layer: ((f >> 6) & 3) as usize,
-            layers: ((f >> 8) & 0xF) as u8,
-            muted: ((f >> 12) & 0xF) as u8,
+            has_loop: f & 16 != 0,
+            layers: ((f >> 8) & 0xFF) as u8,
+            muted: ((f >> 16) & 0xFF) as u8,
+            loop_steps: self.loop_steps.load(Ordering::Relaxed),
             pos: self.pos.get(),
             step: self.step.load(Ordering::Relaxed),
             active_voices: self.voices.load(Ordering::Relaxed),
@@ -225,11 +229,37 @@ pub enum Cmd {
     BeatPlay(bool),
     LoopPlay(bool),
     Metronome(bool),
-    /// Start recording into the first empty layer (with a one-bar count-in
-    /// if the transport is stopped).
-    RecordStart,
-    RecordStop,
+    /// Turn what was just played into a loop layer. With no loop yet, the
+    /// phrase played so far sets the loop length and tempo; afterwards the
+    /// last pass of the loop becomes a new layer.
+    Capture,
     ClearLayer(u8),
+    LayerVolume {
+        layer: u8,
+        volume: f32,
+    },
+    LayerPreset {
+        layer: u8,
+        preset: u8,
+    },
+    /// Set the loop length in steps (0 = no loop). Used when restoring.
+    SetLoopSteps(u16),
+    /// Replace a layer's notes: BeginLayer, then LoadNote for each note,
+    /// then EndLayer. Positions are in steps within the loop.
+    BeginLayer {
+        layer: u8,
+        preset: u8,
+        muted: bool,
+        volume: f32,
+    },
+    LoadNote {
+        layer: u8,
+        note: u8,
+        velocity: u8,
+        on: f32,
+        off: f32,
+    },
+    EndLayer(u8),
     MuteLayer {
         layer: u8,
         muted: bool,
@@ -237,21 +267,44 @@ pub enum Cmd {
     ClearAll,
 }
 
-/// Messages from the engine to the UI (for drawing the loop timeline).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum EngineEvent {
-    /// A note was recorded into `layer` at loop position `t` (in steps).
-    LoopNote {
-        layer: u8,
-        note: u8,
-        on: bool,
-        t: f32,
-    },
-    /// Recording ended. `kept` is false if nothing was played.
-    RecordDone { layer: u8, kept: bool },
+/// Why a capture did not produce a layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureError {
+    /// Nothing was played.
+    Nothing,
+    /// The first phrase was shorter than [`MIN_LOOP_SECONDS`].
+    TooShort,
+    /// All layers hold notes.
+    Full,
 }
 
-const EVENT_QUEUE: usize = 128;
+/// Messages from the engine to the UI.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum EngineEvent {
+    /// The first capture set the loop length and tempo.
+    LoopStarted {
+        steps: u16,
+        bpm: f32,
+    },
+    /// A layer was captured; `notes` LayerNote events follow.
+    LayerCaptured {
+        layer: u8,
+        preset: u8,
+        notes: u16,
+    },
+    /// One captured note; positions in steps within the loop. `off` may be
+    /// smaller than `on` when the note crosses the loop point.
+    LayerNote {
+        layer: u8,
+        note: u8,
+        velocity: u8,
+        on: f32,
+        off: f32,
+    },
+    CaptureFailed(CaptureError),
+}
+
+const EVENT_QUEUE: usize = 4096;
 
 #[derive(Clone, Copy, Debug)]
 struct LoopEvent {
@@ -268,7 +321,35 @@ struct Layer {
     active: bool,
     muted: bool,
     preset: u8,
+    volume: f32,
 }
+
+/// A live note event remembered for capturing.
+#[derive(Clone, Copy, Debug)]
+struct HistEvent {
+    /// Engine sample clock.
+    sample: u64,
+    /// Unwrapped transport position in steps (valid within `epoch`).
+    steps: f64,
+    epoch: u32,
+    note: u8,
+    /// 0 = note-off.
+    velocity: u8,
+    preset: u8,
+}
+
+/// A note assembled during a capture.
+#[derive(Clone, Copy, Debug)]
+struct CapNote {
+    on: f64,
+    off: f64,
+    note: u8,
+    velocity: u8,
+    preset: u8,
+    open: bool,
+}
+
+const CAP_NOTES: usize = LAYER_CAPACITY / 2;
 
 impl Layer {
     fn new() -> Self {
@@ -287,7 +368,16 @@ impl Layer {
             active: false,
             muted: false,
             preset: 0,
+            volume: 1.0,
         }
+    }
+
+    fn sort(&mut self) {
+        // Note-offs before note-ons at the same position (re-triggers).
+        self.events[..self.len].sort_unstable_by(|a, b| {
+            a.t.total_cmp(&b.t)
+                .then((a.velocity > 0).cmp(&(b.velocity > 0)))
+        });
     }
 }
 
@@ -352,12 +442,19 @@ pub struct Engine {
     patterns: [u16; DRUMS],
     drum_presets: [u8; DRUMS],
     layers: [Layer; LAYERS],
-    rec: RecState,
-    rec_layer: usize,
-    /// Steps recorded so far in the current take.
-    rec_progress: f64,
-    /// Live notes whose note-on has been recorded but not their note-off.
-    rec_held: [Option<u8>; 16],
+    has_loop: bool,
+    loop_steps: u32,
+    /// Loop passes since the transport (re)started, for unwrapped positions.
+    wraps: i64,
+    /// Bumped whenever the transport restarts; history positions in steps
+    /// are only comparable within one epoch.
+    epoch: u32,
+    /// Engine sample clock.
+    now: u64,
+    history: Box<[HistEvent]>,
+    hist_head: usize,
+    hist_len: usize,
+    cap: Box<[CapNote]>,
 
     click_phase: f32,
     click_inc: f32,
@@ -406,18 +503,42 @@ impl Engine {
             metronome: false,
             patterns: DEFAULT_PATTERNS,
             drum_presets,
-            layers: [Layer::new(), Layer::new(), Layer::new(), Layer::new()],
-            rec: RecState::Idle,
-            rec_layer: 0,
-            rec_progress: 0.0,
-            rec_held: [None; 16],
+            layers: std::array::from_fn(|_| Layer::new()),
+            has_loop: false,
+            loop_steps: NO_LOOP_STEPS,
+            wraps: 0,
+            epoch: 0,
+            now: 0,
+            history: vec![
+                HistEvent {
+                    sample: 0,
+                    steps: 0.0,
+                    epoch: 0,
+                    note: 0,
+                    velocity: 0,
+                    preset: 0
+                };
+                HISTORY
+            ]
+            .into_boxed_slice(),
+            hist_head: 0,
+            hist_len: 0,
+            cap: vec![
+                CapNote {
+                    on: 0.0,
+                    off: 0.0,
+                    note: 0,
+                    velocity: 0,
+                    preset: 0,
+                    open: false
+                };
+                CAP_NOTES
+            ]
+            .into_boxed_slice(),
             click_phase: 0.0,
             click_inc: 0.0,
             click_env: 0.0,
-            events: [EngineEvent::RecordDone {
-                layer: 0,
-                kept: false,
-            }; EVENT_QUEUE],
+            events: [EngineEvent::CaptureFailed(CaptureError::Nothing); EVENT_QUEUE],
             events_len: 0,
         };
         engine.volume = volume_gain(engine.shared.volume.get());
@@ -483,9 +604,6 @@ impl Engine {
                 if index != self.live_preset {
                     self.release_live();
                     self.live_preset = index;
-                    if self.rec != RecState::Idle {
-                        self.layers[self.rec_layer].preset = index;
-                    }
                     self.update_delay();
                 }
             }
@@ -519,9 +637,6 @@ impl Engine {
                     self.loop_on = true;
                     self.ensure_running();
                 } else {
-                    if self.rec != RecState::Idle {
-                        self.finish_recording();
-                    }
                     self.loop_on = false;
                     for i in 0..LAYERS {
                         self.release_part(PART_LAYER0 + i as u8);
@@ -530,16 +645,91 @@ impl Engine {
                 }
             }
             Cmd::Metronome(on) => self.metronome = on,
-            Cmd::RecordStart => self.start_recording(),
-            Cmd::RecordStop => {
-                if self.rec != RecState::Idle {
-                    self.finish_recording();
-                    self.maybe_stop();
-                }
-            }
+            Cmd::Capture => self.capture(),
             Cmd::ClearLayer(layer) => {
                 self.clear_layer(layer as usize);
+                if !self.layers.iter().any(|l| l.active) {
+                    self.reset_loop();
+                }
                 self.maybe_stop();
+            }
+            Cmd::LayerVolume { layer, volume } => {
+                if let Some(l) = self.layers.get_mut(layer as usize) {
+                    l.volume = volume.clamp(0.0, 1.5);
+                    self.macros[PART_LAYER0 as usize + layer as usize].gain = l.volume;
+                }
+            }
+            Cmd::LayerPreset { layer, preset } => {
+                if (layer as usize) < LAYERS {
+                    self.layers[layer as usize].preset = preset.min(PRESETS.len() as u8 - 1);
+                    self.release_part(PART_LAYER0 + layer);
+                }
+            }
+            Cmd::SetLoopSteps(steps) => {
+                if steps == 0 {
+                    self.reset_loop();
+                } else {
+                    self.has_loop = true;
+                    self.loop_steps = u32::from(steps);
+                }
+            }
+            Cmd::BeginLayer {
+                layer,
+                preset,
+                muted,
+                volume,
+            } => {
+                if (layer as usize) < LAYERS {
+                    self.release_part(PART_LAYER0 + layer);
+                    let l = &mut self.layers[layer as usize];
+                    l.active = false;
+                    l.len = 0;
+                    l.cursor = 0;
+                    l.preset = preset.min(PRESETS.len() as u8 - 1);
+                    l.muted = muted;
+                    l.volume = volume.clamp(0.0, 1.5);
+                    self.macros[PART_LAYER0 as usize + layer as usize] = Macros {
+                        gain: l.volume,
+                        ..Macros::NEUTRAL
+                    };
+                }
+            }
+            Cmd::LoadNote {
+                layer,
+                note,
+                velocity,
+                on,
+                off,
+            } => {
+                let steps = self.loop_steps as f32;
+                if let Some(l) = self.layers.get_mut(layer as usize) {
+                    if l.len + 2 <= LAYER_CAPACITY && on.is_finite() && off.is_finite() {
+                        let on = on.rem_euclid(steps);
+                        let off = off.rem_euclid(steps);
+                        l.events[l.len] = LoopEvent {
+                            t: on,
+                            note,
+                            velocity: velocity.max(1),
+                        };
+                        l.events[l.len + 1] = LoopEvent {
+                            t: off,
+                            note,
+                            velocity: 0,
+                        };
+                        l.len += 2;
+                    }
+                }
+            }
+            Cmd::EndLayer(layer) => {
+                let pos = self.transport.pos() as f32;
+                if let Some(l) = self.layers.get_mut(layer as usize) {
+                    l.sort();
+                    l.active = l.len > 0;
+                    l.cursor = l.events[..l.len]
+                        .iter()
+                        .position(|e| e.t >= pos)
+                        .unwrap_or(l.len);
+                }
             }
             Cmd::MuteLayer { layer, muted } => {
                 if let Some(l) = self.layers.get_mut(layer as usize) {
@@ -553,6 +743,7 @@ impl Engine {
                 for i in 0..LAYERS {
                     self.clear_layer(i);
                 }
+                self.reset_loop();
                 self.maybe_stop();
             }
         }
@@ -567,20 +758,33 @@ impl Engine {
 
     fn ensure_running(&mut self) {
         if !self.transport.running {
-            self.transport.start(0.0);
-            self.next_step = 0;
-            for l in self.layers.iter_mut() {
-                l.cursor = 0;
-            }
+            self.restart_transport();
         }
+    }
+
+    fn restart_transport(&mut self) {
+        self.transport.start(0.0);
+        self.next_step = 0;
+        self.wraps = 0;
+        self.epoch = self.epoch.wrapping_add(1);
+        for l in self.layers.iter_mut() {
+            l.cursor = 0;
+        }
+    }
+
+    /// Forget the loop length (no layers left).
+    fn reset_loop(&mut self) {
+        self.has_loop = false;
+        self.loop_steps = NO_LOOP_STEPS;
+        self.loop_on = false;
     }
 
     /// Stop the clock when nothing needs it any more.
     fn maybe_stop(&mut self) {
-        if self.rec == RecState::Idle && !self.layers.iter().any(|l| l.active) {
+        if !self.layers.iter().any(|l| l.active) {
             self.loop_on = false;
         }
-        if !self.beat_on && !self.loop_on && self.rec == RecState::Idle && self.transport.running {
+        if !self.beat_on && !self.loop_on && self.transport.running {
             self.transport.stop();
             self.next_step = 0;
             for i in 0..LAYERS {
@@ -645,28 +849,48 @@ impl Engine {
         if let Some(note) = self.arp.note.take() {
             self.live_off(note);
         }
-        for i in 0..self.rec_held.len() {
-            if let Some(note) = self.rec_held[i] {
-                self.live_off(note);
-            }
-        }
         self.release_part(PART_LIVE);
         self.preview_off = NEVER;
     }
 
     fn live_on(&mut self, note: u8, velocity: u8) {
         self.note_on(PART_LIVE, self.live_preset, note, velocity);
-        if self.rec != RecState::Idle {
-            self.record(note, velocity);
-        }
+        self.remember(note, velocity);
     }
 
     fn live_off(&mut self, note: u8) {
         self.note_off(PART_LIVE, note);
-        if let Some(slot) = self.rec_held.iter().position(|n| *n == Some(note)) {
-            self.rec_held[slot] = None;
-            self.record(note, 0);
-        }
+        self.remember(note, 0);
+    }
+
+    /// Unwrapped transport position in steps.
+    fn unwrapped_pos(&self) -> f64 {
+        self.wraps as f64 * f64::from(self.loop_steps) + self.transport.pos()
+    }
+
+    /// Add a live note event to the capture history (a ring buffer).
+    fn remember(&mut self, note: u8, velocity: u8) {
+        let event = HistEvent {
+            sample: self.now,
+            steps: if self.transport.running {
+                self.unwrapped_pos()
+            } else {
+                f64::NAN
+            },
+            epoch: self.epoch,
+            note,
+            velocity,
+            preset: self.live_preset,
+        };
+        self.history[self.hist_head] = event;
+        self.hist_head = (self.hist_head + 1) % HISTORY;
+        self.hist_len = (self.hist_len + 1).min(HISTORY);
+    }
+
+    /// History event `i` counted from the oldest.
+    fn hist(&self, i: usize) -> HistEvent {
+        let oldest = (self.hist_head + HISTORY - self.hist_len) % HISTORY;
+        self.history[(oldest + i) % HISTORY]
     }
 
     fn arp_step(&mut self) {
@@ -837,127 +1061,176 @@ impl Engine {
     // ------------------------------------------------------------------
     // Looper
 
-    fn start_recording(&mut self) {
-        if self.rec != RecState::Idle {
-            return;
+    /// Pair up remembered note events whose note-on lies in `[from, to]`
+    /// (measured with `at`) into `self.cap`. Notes still held at `to` end
+    /// there. Returns the number of notes.
+    fn collect(&mut self, from: f64, to: f64, at: impl Fn(&HistEvent) -> Option<f64>) -> usize {
+        let mut count = 0usize;
+        for i in 0..self.hist_len {
+            let e = self.hist(i);
+            let Some(x) = at(&e) else { continue };
+            if e.velocity > 0 {
+                if x >= from && x <= to && count < CAP_NOTES {
+                    self.cap[count] = CapNote {
+                        on: x,
+                        off: to,
+                        note: e.note,
+                        velocity: e.velocity,
+                        preset: e.preset,
+                        open: true,
+                    };
+                    count += 1;
+                }
+            } else if let Some(n) = self.cap[..count]
+                .iter_mut()
+                .rev()
+                .find(|n| n.open && n.note == e.note)
+            {
+                n.off = x.min(to);
+                n.open = false;
+            }
         }
+        count
+    }
+
+    fn capture(&mut self) {
         let Some(slot) = self.layers.iter().position(|l| !l.active) else {
+            self.emit(EngineEvent::CaptureFailed(CaptureError::Full));
             return;
         };
-        let layer = &mut self.layers[slot];
-        layer.len = 0;
-        layer.cursor = 0;
-        layer.muted = false;
-        layer.preset = self.live_preset;
-        self.rec_layer = slot;
-        self.rec_held = [None; 16];
-        self.rec_progress = 0.0;
-        if self.transport.running {
-            self.rec = RecState::Recording;
-        } else {
-            // One-bar count-in.
-            self.transport.start(-(STEPS_PER_BAR as f64));
-            self.next_step = -(STEPS_PER_BAR as i64);
-            for l in self.layers.iter_mut() {
-                l.cursor = 0;
-            }
-            self.rec = RecState::CountIn;
-        }
-        self.loop_on = true;
-    }
-
-    /// Store a live note event in the layer being recorded.
-    fn record(&mut self, note: u8, velocity: u8) {
-        let pos = self.transport.pos();
-        let t = if self.rec == RecState::CountIn {
-            // Forgive notes played just ahead of the downbeat: they land on
-            // the first step. Anything earlier is not recorded.
-            if pos < -2.0 && velocity > 0 {
-                return;
-            }
-            0.0
-        } else {
-            pos.rem_euclid(LOOP_STEPS as f64) as f32
-        };
-        let slot = self.rec_layer;
-        let layer = &mut self.layers[slot];
-        // Keep room for the note-offs of held notes.
-        let reserve = if velocity > 0 {
-            self.rec_held.len() + 1
-        } else {
-            0
-        };
-        if layer.len + reserve >= LAYER_CAPACITY {
-            return;
-        }
-        if velocity > 0 {
-            match self.rec_held.iter().position(|n| n.is_none()) {
-                Some(free) => self.rec_held[free] = Some(note),
-                None => return,
-            }
-        }
-        layer.events[layer.len] = LoopEvent { t, note, velocity };
-        layer.len += 1;
-        self.emit(EngineEvent::LoopNote {
-            layer: slot as u8,
-            note,
-            on: velocity > 0,
-            t,
-        });
-    }
-
-    fn finish_recording(&mut self) {
-        let slot = self.rec_layer;
-        if self.rec == RecState::Recording {
-            // Close notes that are still held.
-            for i in 0..self.rec_held.len() {
-                if let Some(note) = self.rec_held[i].take() {
-                    self.record(note, 0);
+        let sr = f64::from(self.sample_rate);
+        let (count, from, scale) = if !self.has_loop {
+            // The phrase: walk back from now over notes with no long pause.
+            let now = self.now;
+            // Silence before the tap belongs to the loop; only a pause
+            // between notes ends the phrase.
+            let mut start = None;
+            let mut last: Option<u64> = None;
+            for i in (0..self.hist_len).rev() {
+                let e = self.hist(i);
+                let gap = last.map_or(0, |l| l.saturating_sub(e.sample));
+                if gap as f64 > PHRASE_GAP_SECONDS * sr
+                    || now.saturating_sub(e.sample) as f64 > MAX_LOOP_SECONDS * sr
+                {
+                    break;
+                }
+                last = Some(e.sample);
+                if e.velocity > 0 {
+                    start = Some(e.sample);
                 }
             }
-        }
-        if self.rec == RecState::CountIn {
-            self.layers[slot].len = 0;
-        }
-        self.rec_held = [None; 16];
-        self.rec = RecState::Idle;
-        let pos = self.transport.pos().rem_euclid(LOOP_STEPS as f64) as f32;
+            let Some(start) = start else {
+                self.emit(EngineEvent::CaptureFailed(CaptureError::Nothing));
+                return;
+            };
+            let seconds = (now - start) as f64 / sr;
+            if seconds < MIN_LOOP_SECONDS {
+                self.emit(EngineEvent::CaptureFailed(CaptureError::TooShort));
+                return;
+            }
+            // Infer the tempo: the bar count whose BPM is nearest the target.
+            let mut best = (4u32, f64::INFINITY);
+            for bars in [1u32, 2, 4, 8] {
+                let bpm = 60.0 * 4.0 * f64::from(bars) / seconds;
+                let in_range = bpm >= f64::from(MIN_BPM) - 1e-9 && bpm <= f64::from(MAX_BPM) + 1e-9;
+                if in_range && (bpm - TARGET_BPM).abs() < best.1 {
+                    best = (bars, (bpm - TARGET_BPM).abs());
+                }
+            }
+            let steps = best.0 * STEPS_PER_BAR as u32;
+            let count = self.collect(start as f64, now as f64, |e| Some(e.sample as f64));
+            if count == 0 {
+                self.emit(EngineEvent::CaptureFailed(CaptureError::Nothing));
+                return;
+            }
+            let bpm = (60.0 * 4.0 * f64::from(best.0) / seconds) as f32;
+            self.has_loop = true;
+            self.loop_steps = steps;
+            self.transport.set_bpm(bpm);
+            self.update_delay();
+            self.restart_transport();
+            self.emit(EngineEvent::LoopStarted {
+                steps: steps as u16,
+                bpm: self.transport.bpm(),
+            });
+            (count, start as f64, f64::from(steps) / (now - start) as f64)
+        } else {
+            if !self.transport.running {
+                self.emit(EngineEvent::CaptureFailed(CaptureError::Nothing));
+                return;
+            }
+            // The last pass of the loop.
+            let to = self.unwrapped_pos();
+            let from = to - f64::from(self.loop_steps);
+            let epoch = self.epoch;
+            let count = self.collect(from, to, |e| {
+                (e.epoch == epoch && e.steps.is_finite()).then_some(e.steps)
+            });
+            if count == 0 {
+                self.emit(EngineEvent::CaptureFailed(CaptureError::Nothing));
+                return;
+            }
+            (count, 0.0, 1.0)
+        };
+
+        let steps = f64::from(self.loop_steps);
+        let first_preset = self.cap[0].preset;
         let live_macros = self.macros[PART_LIVE as usize];
         let layer = &mut self.layers[slot];
-        let kept = layer.len > 0;
-        if kept {
-            // Events were appended in playing order, which wraps around the
-            // loop end at most once: rotate them into time order.
-            let events = &mut layer.events[..layer.len];
-            if let Some(split) = (1..events.len()).find(|&i| events[i].t < events[i - 1].t) {
-                events.rotate_left(split);
-            }
-            layer.active = true;
-            layer.cursor = events
-                .iter()
-                .position(|e| e.t > pos)
-                .unwrap_or(events.len());
-            self.macros[PART_LAYER0 as usize + slot] = live_macros;
-        } else {
-            layer.active = false;
+        layer.len = 0;
+        layer.preset = first_preset;
+        layer.muted = false;
+        layer.volume = 1.0;
+        for n in &self.cap[..count] {
+            let on = ((n.on - from) * scale).rem_euclid(steps);
+            let length = ((n.off - n.on) * scale).clamp(0.05, steps - 0.05);
+            let off = (on + length).rem_euclid(steps);
+            layer.events[layer.len] = LoopEvent {
+                t: on as f32,
+                note: n.note,
+                velocity: n.velocity,
+            };
+            layer.events[layer.len + 1] = LoopEvent {
+                t: off as f32,
+                note: n.note,
+                velocity: 0,
+            };
+            layer.len += 2;
         }
-        self.emit(EngineEvent::RecordDone {
+        layer.sort();
+        let pos = self.transport.pos() as f32;
+        layer.cursor = layer.events[..layer.len]
+            .iter()
+            .position(|e| e.t >= pos)
+            .unwrap_or(layer.len);
+        layer.active = true;
+        self.macros[PART_LAYER0 as usize + slot] = Macros {
+            gain: 1.0,
+            ..live_macros
+        };
+        self.loop_on = true;
+        self.emit(EngineEvent::LayerCaptured {
             layer: slot as u8,
-            kept,
+            preset: first_preset,
+            notes: count as u16,
         });
+        for i in 0..count {
+            let n = self.cap[i];
+            let on = ((n.on - from) * scale).rem_euclid(steps);
+            let length = ((n.off - n.on) * scale).clamp(0.05, steps - 0.05);
+            self.emit(EngineEvent::LayerNote {
+                layer: slot as u8,
+                note: n.note,
+                velocity: n.velocity,
+                on: on as f32,
+                off: (on + length).rem_euclid(steps) as f32,
+            });
+        }
     }
 
     fn clear_layer(&mut self, index: usize) {
         if index >= LAYERS {
             return;
-        }
-        if self.rec != RecState::Idle && self.rec_layer == index {
-            self.rec = RecState::Idle;
-            self.rec_held = [None; 16];
-            self.emit(EngineEvent::RecordDone {
-                layer: index as u8,
-                kept: false,
-            });
         }
         let layer = &mut self.layers[index];
         layer.active = false;
@@ -972,10 +1245,6 @@ impl Engine {
 
     fn on_step(&mut self, step: i64) {
         self.shared.step.store(step as i32, Ordering::Relaxed);
-        if step == 0 && self.rec == RecState::CountIn {
-            self.rec = RecState::Recording;
-            self.rec_progress = 0.0;
-        }
         let in_bar = step.rem_euclid(STEPS_PER_BAR as i64) as usize;
         if step >= 0 && self.beat_on {
             for drum in 0..DRUMS {
@@ -1000,9 +1269,10 @@ impl Engine {
         }
         if self.transport.running {
             loop {
-                if self.transport.samples_until(LOOP_STEPS as f64) == 0 {
-                    self.transport.wrap();
-                    self.next_step -= LOOP_STEPS as i64;
+                if self.transport.samples_until(f64::from(self.loop_steps)) == 0 {
+                    self.transport.wrap(self.loop_steps);
+                    self.wraps += 1;
+                    self.next_step -= i64::from(self.loop_steps);
                     for l in self.layers.iter_mut() {
                         l.cursor = 0;
                     }
@@ -1015,10 +1285,6 @@ impl Engine {
                     continue;
                 }
                 break;
-            }
-            if self.rec == RecState::Recording && self.rec_progress >= LOOP_STEPS as f64 - 1.0e-6 {
-                self.finish_recording();
-                self.maybe_stop();
             }
             for i in 0..LAYERS {
                 if !self.layers[i].active {
@@ -1054,12 +1320,8 @@ impl Engine {
     fn next_event_distance(&self) -> u64 {
         let mut d = self.preview_off.min(self.arp.next).min(self.arp.off);
         if self.transport.running {
-            d = d.min(self.transport.samples_until(LOOP_STEPS as f64));
+            d = d.min(self.transport.samples_until(f64::from(self.loop_steps)));
             d = d.min(self.transport.samples_until(self.next_step as f64));
-            if self.rec == RecState::Recording {
-                let left = (LOOP_STEPS as f64 - self.rec_progress).max(0.0);
-                d = d.min((left * self.transport.samples_per_step()).ceil() as u64);
-            }
             for l in self.layers.iter() {
                 if l.active && l.cursor < l.len {
                     d = d.min(
@@ -1079,10 +1341,8 @@ impl Engine {
                 *t = t.saturating_sub(n64);
             }
         }
+        self.now += n64;
         if self.transport.running {
-            if self.rec == RecState::Recording {
-                self.rec_progress += n as f64 / self.transport.samples_per_step();
-            }
             self.transport.advance(n);
         }
     }
@@ -1098,6 +1358,7 @@ impl Engine {
             attack: attack_multiplier(s.attack.get()),
             release: release_multiplier(s.release.get()),
             reverb: s.reverb.get().clamp(0.0, 1.0),
+            gain: 1.0,
         }
     }
 
@@ -1181,18 +1442,14 @@ impl Engine {
         flags |= u32::from(self.beat_on) << 1;
         flags |= u32::from(self.loop_on) << 2;
         flags |= u32::from(self.metronome) << 3;
-        flags |= match self.rec {
-            RecState::Idle => 0,
-            RecState::CountIn => 1,
-            RecState::Recording => 2,
-        } << 4;
-        flags |= (self.rec_layer as u32 & 3) << 6;
+        flags |= u32::from(self.has_loop) << 4;
         for (i, l) in self.layers.iter().enumerate() {
             flags |= u32::from(l.active) << (8 + i);
-            flags |= u32::from(l.muted) << (12 + i);
+            flags |= u32::from(l.muted) << (16 + i);
         }
         let s = &self.shared;
         s.flags.store(flags, Ordering::Relaxed);
+        s.loop_steps.store(self.loop_steps, Ordering::Relaxed);
         s.pos.set(self.transport.pos() as f32);
         if !self.transport.running {
             s.step.store(-1, Ordering::Relaxed);

@@ -199,47 +199,6 @@ pub fn metronome(p: &Painter, c: Pos2, size: f32, color: Color32) {
     );
 }
 
-/// Speaker; with `muted` it gets a cross, otherwise sound waves.
-pub fn speaker(p: &Painter, c: Pos2, size: f32, color: Color32, muted: bool) {
-    let s = size * 0.15;
-    let x0 = c.x - size * 0.3;
-    let body = [
-        pos2(x0, c.y - s),
-        pos2(x0 + s * 1.1, c.y - s),
-        pos2(x0 + s * 2.6, c.y - s * 2.3),
-        pos2(x0 + s * 2.6, c.y + s * 2.3),
-        pos2(x0 + s * 1.1, c.y + s),
-        pos2(x0, c.y + s),
-        pos2(x0, c.y - s),
-    ];
-    polyline(p, &body, W, color);
-    let right = pos2(c.x + size * 0.2, c.y);
-    if muted {
-        let d = size * 0.11;
-        polyline(p, &[right + vec2(-d, -d), right + vec2(d, d)], W, color);
-        polyline(p, &[right + vec2(-d, d), right + vec2(d, -d)], W, color);
-    } else {
-        arc(
-            p,
-            pos2(c.x + size * 0.02, c.y),
-            size * 0.2,
-            -45.0,
-            45.0,
-            W,
-            color,
-        );
-        arc(
-            p,
-            pos2(c.x + size * 0.02, c.y),
-            size * 0.34,
-            -40.0,
-            40.0,
-            W,
-            color,
-        );
-    }
-}
-
 pub fn trash(p: &Painter, c: Pos2, size: f32, color: Color32) {
     let w = size * 0.24;
     let top = c.y - size * 0.2;
@@ -454,4 +413,33 @@ pub fn flat(p: &Painter, pos: Pos2, height: f32, color: Color32) -> f32 {
     }
     polyline(p, &pts, stroke_w, color);
     w + stroke_w * 1.5
+}
+
+/// Clockwise arrow (mirror of `undo`).
+pub fn redo(p: &Painter, c: Pos2, size: f32, color: Color32) {
+    let r = size * 0.3;
+    let centre = c + vec2(0.0, size * 0.04);
+    arc(p, centre, r, 70.0, 330.0, W, color);
+    let a = 330.0f32.to_radians();
+    let tip = centre + vec2(a.cos(), a.sin()) * r;
+    let s = size * 0.2;
+    polyline(
+        p,
+        &[tip + vec2(s * 0.2, -s), tip, tip + vec2(-s, -s * 0.15)],
+        W,
+        color,
+    );
+}
+
+/// Two vertical bars.
+pub fn pause(p: &Painter, c: Pos2, size: f32, color: Color32) {
+    let h = size * 0.3;
+    let w = size * 0.11;
+    for dx in [-size * 0.14, size * 0.14] {
+        p.rect_filled(
+            Rect::from_center_size(c + vec2(dx, 0.0), vec2(w * 2.0, h * 2.0)),
+            2.0,
+            color,
+        );
+    }
 }

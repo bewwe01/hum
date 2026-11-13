@@ -18,12 +18,13 @@ pub struct Shots {
     slot: Arc<Mutex<Option<Arc<egui::ColorImage>>>>,
 }
 
-const NAMES: [&str; 9] = [
+const NAMES: [&str; 10] = [
     "play",
     "play-keys",
     "sounds",
     "loop",
-    "loop-recording",
+    "loop-layers",
+    "play-looped",
     "beats",
     "settings",
     "sheet-scale",
@@ -73,22 +74,65 @@ fn arrange(app: &mut HumApp, step: usize) {
         }
         3 => app.tab = Tab::Loop,
         4 => {
-            app.tab = Tab::Loop;
-            app.send(Cmd::SetBpm(160.0));
-            app.send(Cmd::RecordStart);
-        }
-        5 => {
-            app.send(Cmd::ClearAll);
+            // A demo loop: 2 bars, three layers with different sounds.
+            use crate::state::{LoopLayer, LoopNote, Looper};
+            let mut looper = Looper::new(32);
+            let layer = |sound: &str, notes: &[(u8, f32, f32)], muted: bool| LoopLayer {
+                sound: sound.to_owned(),
+                muted,
+                notes: notes
+                    .iter()
+                    .map(|&(note, on, off)| LoopNote {
+                        note,
+                        velocity: 100,
+                        on,
+                        off,
+                    })
+                    .collect(),
+                ..LoopLayer::default()
+            };
+            looper.layers[0] = Some(layer(
+                "Warm Cloud",
+                &[(48, 0.0, 15.0), (53, 16.0, 31.0)],
+                false,
+            ));
+            looper.layers[1] = Some(layer(
+                "Pluck Harp",
+                &[
+                    (60, 2.0, 3.0),
+                    (63, 6.0, 7.0),
+                    (67, 10.0, 11.0),
+                    (65, 18.0, 19.0),
+                    (63, 22.0, 23.0),
+                ],
+                false,
+            ));
+            looper.layers[2] = Some(layer(
+                "Sub Thump",
+                &[(36, 0.0, 2.0), (36, 8.0, 10.0), (41, 16.0, 18.0)],
+                true,
+            ));
+            looper.order = vec![0, 1, 2];
+            app.st.looper = Some(looper);
             app.send(Cmd::SetBpm(110.0));
+            app.send(Cmd::SetLoopSteps(32));
+            for slot in 0..3 {
+                app.send_layer(slot);
+            }
+            app.send(Cmd::LoopPlay(true));
+            app.tab = Tab::Loop;
+        }
+        5 => app.tab = Tab::Play,
+        6 => {
             app.send(Cmd::BeatPlay(true));
             app.tab = Tab::Beats;
         }
-        6 => {
+        7 => {
             app.send(Cmd::BeatPlay(false));
             app.tab = Tab::Play;
             app.settings_open = true;
         }
-        7 => {
+        8 => {
             app.tab = Tab::Play;
             app.sheet = Some(Sheet::Scale);
         }
@@ -128,7 +172,7 @@ pub fn drive(app: &mut HumApp, ctx: &egui::Context) {
     }
     shots.wait += 1;
     // Let the screen settle (and the fake recording run) before the shot.
-    let frames = if shots.step == 4 { 90 } else { 12 };
+    let frames = if shots.step == 4 { 40 } else { 12 };
     if shots.wait == frames && !shots.requested {
         let slot = shots.slot.clone();
         let repaint = ctx.clone();

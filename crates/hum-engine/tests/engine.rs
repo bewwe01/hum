@@ -6,11 +6,11 @@
 
 use std::sync::Arc;
 
-use hum_engine::engine::{Cmd, Engine, EngineEvent, RecState, Shared, VOICES};
+use hum_engine::engine::{CaptureError, Cmd, Engine, EngineEvent, Shared, LAYERS, VOICES};
 use hum_engine::fx::Limiter;
 use hum_engine::presets::{self, PRESETS};
 use hum_engine::scale::{KeyMap, Scale};
-use hum_engine::transport::{step_sample, LOOP_STEPS};
+use hum_engine::transport::step_sample;
 
 const SR: f32 = 48_000.0;
 
@@ -22,6 +22,23 @@ fn select(e: &mut Engine, name: &str) {
     let index = presets::find(name).unwrap_or_else(|| panic!("no preset {name}"));
     e.handle(Cmd::SetPreset(index as u8));
     e.shared().reverb.set(PRESETS[index].reverb);
+}
+
+/// Select a sound with its reverb off, and let the reverb setting settle.
+fn select_dry(e: &mut Engine, name: &str) {
+    select(e, name);
+    e.shared().reverb.set(0.0);
+    let mut sink = Vec::new();
+    render(e, 24_000, &mut sink);
+}
+
+/// First frame at or after `from` louder than `threshold`.
+fn first_loud(samples: &[f32], from: usize, threshold: f32) -> Option<usize> {
+    samples
+        .chunks_exact(2)
+        .skip(from)
+        .position(|f| f[0].abs().max(f[1].abs()) > threshold)
+        .map(|i| i + from)
 }
 
 /// Render `frames` frames in awkward, varying chunk sizes (as a real audio
@@ -299,259 +316,6 @@ fn beat_reports_steps_and_stopping_resets_the_playhead() {
     assert_eq!(status.pos, 0.0);
 }
 
-/// Record one note into the looper and return (engine, absolute sample of
-/// the start of the first recorded loop pass).
-fn record_one_note(bpm: f32, offset: usize, length: usize) -> (Engine, usize, Vec<EngineEvent>) {
-    let mut e = engine();
-    select(&mut e, "Pixel Pulse");
-    e.shared().reverb.set(0.0);
-    e.handle(Cmd::SetBpm(bpm));
-    e.handle(Cmd::RecordStart);
-    assert_eq!(e.shared().status().rec, RecState::CountIn);
-    let mut out = Vec::new();
-    // One bar of count-in (metronome off, so it is silent).
-    let count_in = step_sample(16, bpm, SR) as usize;
-    render(&mut e, count_in, &mut out);
-    assert_eq!(peak(&out), 0.0);
-    render(&mut e, offset, &mut out);
-    assert_eq!(e.shared().status().rec, RecState::Recording);
-    e.handle(Cmd::NoteOn {
-        note: 60,
-        velocity: 100,
-    });
-    render(&mut e, length, &mut out);
-    e.handle(Cmd::NoteOff { note: 60 });
-    let events = drain(&mut e);
-    (e, count_in, events)
-}
-
-#[test]
-fn looper_replays_recorded_events_at_the_right_times() {
-    // 120 BPM: one step is exactly 6000 samples, the loop 384000.
-    let bpm = 120.0;
-    let loop_len = step_sample(LOOP_STEPS as u64, bpm, SR) as usize;
-    assert_eq!(loop_len, 384_000);
-    let (offset, length) = (12_000usize, 6_000usize);
-    let (mut e, count_in, events) = record_one_note(bpm, offset, length);
-    assert_eq!(
-        events,
-        vec![
-            EngineEvent::LoopNote {
-                layer: 0,
-                note: 60,
-                on: true,
-                t: 2.0
-            },
-            EngineEvent::LoopNote {
-                layer: 0,
-                note: 60,
-                on: false,
-                t: 3.0
-            },
-        ]
-    );
-
-    // Finish the first pass: the take ends by itself after four bars.
-    let mut out = Vec::new();
-    let played = offset + length;
-    render(&mut e, loop_len - played, &mut out);
-    let mut out = Vec::new();
-    render(&mut e, 1, &mut out);
-    assert_eq!(
-        drain(&mut e),
-        vec![EngineEvent::RecordDone {
-            layer: 0,
-            kept: true
-        }]
-    );
-    let status = e.shared().status();
-    assert_eq!(status.rec, RecState::Idle);
-    assert_eq!(status.layers, 0b0001);
-    assert!(status.loop_on && status.running);
-
-    // Second and third pass: the note comes back exactly one loop later.
-    render(&mut e, 2 * loop_len - 1, &mut out);
-    let _ = count_in;
-    assert_eq!(
-        first_sound(&out),
-        Some(offset),
-        "replay must start on the recorded sample"
-    );
-    let second_pass = &out[loop_len * 2..];
-    assert_eq!(
-        first_sound(second_pass),
-        Some(offset),
-        "and again on the next pass"
-    );
-    // The replayed note also ends: silence returns before the pass is over.
-    assert_eq!(peak(&out[(loop_len - 48_000) * 2..loop_len * 2]), 0.0);
-    assert_clean(&out, "loop playback");
-
-    // Muting silences the layer; un-muting brings it back; clearing empties it.
-    e.handle(Cmd::MuteLayer {
-        layer: 0,
-        muted: true,
-    });
-    out.clear();
-    render(&mut e, loop_len, &mut out);
-    assert_eq!(peak(&out), 0.0);
-    e.handle(Cmd::MuteLayer {
-        layer: 0,
-        muted: false,
-    });
-    out.clear();
-    render(&mut e, loop_len, &mut out);
-    assert_eq!(first_sound(&out), Some(offset));
-    e.handle(Cmd::ClearLayer(0));
-    let status = e.shared().status();
-    assert_eq!(status.layers, 0);
-    assert!(
-        !status.running,
-        "the clock stops when nothing is left to play"
-    );
-}
-
-#[test]
-fn looper_timing_holds_at_other_tempos() {
-    for &bpm in &[60.0f32, 110.0, 160.0] {
-        let loop_len = step_sample(LOOP_STEPS as u64, bpm, SR) as usize;
-        let (offset, length) = (10_007usize, 4_321usize);
-        let (mut e, _, _) = record_one_note(bpm, offset, length);
-        let mut out = Vec::new();
-        render(&mut e, loop_len - offset - length, &mut out);
-        out.clear();
-        render(&mut e, loop_len, &mut out);
-        let start = first_sound(&out).expect("the layer must replay") as i64;
-        // Positions are stored as f32 steps, which is finer than a sample
-        // but can round across a sample boundary.
-        assert!(
-            (start - offset as i64).abs() <= 1,
-            "bpm {bpm}: {start} vs {offset}"
-        );
-    }
-}
-
-#[test]
-fn each_layer_keeps_its_own_sound_and_undo_order() {
-    let mut e = engine();
-    e.handle(Cmd::SetBpm(160.0));
-    let loop_len = step_sample(LOOP_STEPS as u64, 160.0, SR) as usize;
-    let mut out = Vec::new();
-    for (layer, name) in ["Pixel Pulse", "Soft Sine", "Chip Bass", "Marimba"]
-        .iter()
-        .enumerate()
-    {
-        select(&mut e, name);
-        e.handle(Cmd::RecordStart);
-        let status = e.shared().status();
-        assert_eq!(status.rec_layer, layer);
-        let wait = if layer == 0 {
-            step_sample(16, 160.0, SR) as usize
-        } else {
-            0
-        };
-        render(&mut e, wait + 4_500, &mut out);
-        e.handle(Cmd::NoteOn {
-            note: 60 + layer as u8,
-            velocity: 90,
-        });
-        render(&mut e, 9_000, &mut out);
-        e.handle(Cmd::NoteOff {
-            note: 60 + layer as u8,
-        });
-        render(&mut e, loop_len, &mut out);
-        assert_eq!(e.shared().status().layers, (1u8 << (layer + 1)) - 1);
-    }
-    // A fifth take has nowhere to go.
-    e.handle(Cmd::RecordStart);
-    assert_eq!(e.shared().status().rec, RecState::Idle);
-    assert_clean(&out, "four layers");
-    e.handle(Cmd::ClearAll);
-    assert_eq!(e.shared().status().layers, 0);
-}
-
-#[test]
-fn empty_take_is_discarded() {
-    let mut e = engine();
-    e.handle(Cmd::SetBpm(160.0));
-    e.handle(Cmd::RecordStart);
-    let mut out = Vec::new();
-    let total = step_sample(16 + LOOP_STEPS as u64, 160.0, SR) as usize;
-    render(&mut e, total + 10, &mut out);
-    assert_eq!(
-        drain(&mut e),
-        vec![EngineEvent::RecordDone {
-            layer: 0,
-            kept: false
-        }]
-    );
-    let status = e.shared().status();
-    assert_eq!(status.layers, 0);
-    assert!(!status.running);
-}
-
-#[test]
-fn count_in_clicks_only_with_the_metronome() {
-    let mut e = engine();
-    e.handle(Cmd::Metronome(true));
-    e.handle(Cmd::RecordStart);
-    let mut out = Vec::new();
-    render(&mut e, 2_000, &mut out);
-    assert_eq!(
-        first_sound(&out),
-        Some(1),
-        "the first click starts with the count-in"
-    );
-    assert!(peak(&out) > 0.05);
-}
-
-#[test]
-fn arpeggiator_walks_the_scale_in_time() {
-    let mut e = engine();
-    select(&mut e, "Rain Arp"); // up, sixteenth notes, two octaves
-    e.handle(Cmd::SetBpm(120.0));
-    e.handle(Cmd::SetKeyMap(KeyMap {
-        root: 0,
-        scale: Scale::MinorPentatonic,
-        locked: true,
-        octave: 3,
-    }));
-    e.handle(Cmd::RecordStart);
-    let mut out = Vec::new();
-    render(&mut e, 96_000, &mut out); // count-in
-    e.handle(Cmd::KeyDown {
-        key: 0,
-        velocity: 100,
-    });
-    render(&mut e, 6_000 * 12 + 10, &mut out);
-    e.handle(Cmd::KeyUp { key: 0 });
-    render(&mut e, 12_000, &mut out);
-    let ons: Vec<(u8, f32)> = drain(&mut e)
-        .into_iter()
-        .filter_map(|ev| match ev {
-            EngineEvent::LoopNote {
-                note, on: true, t, ..
-            } => Some((note, t)),
-            _ => None,
-        })
-        .collect();
-    let notes: Vec<u8> = ons.iter().map(|(n, _)| *n).collect();
-    // One held key becomes a chord from the scale (degrees 1, 3, 5 of C
-    // minor pentatonic = C, F, B flat), climbing through two octaves.
-    assert_eq!(&notes[..8], &[48, 53, 58, 60, 65, 70, 48, 53]);
-    assert!(notes.len() >= 12);
-    for (i, (_, t)) in ons.iter().enumerate() {
-        assert!((t - i as f32).abs() < 0.01, "arp step {i} at {t}");
-    }
-    for note in &notes {
-        assert!(
-            [0, 3, 5, 7, 10].contains(&(note % 12)),
-            "{note} is outside the scale"
-        );
-    }
-    assert_clean(&out, "arp");
-}
-
 #[test]
 fn arpeggiator_free_runs_without_the_transport() {
     // With the transport stopped an arp starts on the key press and steps at
@@ -626,4 +390,245 @@ fn works_at_other_sample_rates() {
         assert_clean(&out, "sample rate");
         assert!(peak(&out) > 0.01);
     }
+}
+
+/// Play `note` for `length` samples starting now, then `rest` samples of
+/// silence.
+fn play(e: &mut Engine, note: u8, length: usize, rest: usize, out: &mut Vec<f32>) {
+    e.handle(Cmd::NoteOn {
+        note,
+        velocity: 100,
+    });
+    render(e, length, out);
+    e.handle(Cmd::NoteOff { note });
+    render(e, rest, out);
+}
+
+fn captured_notes(events: &[EngineEvent]) -> Vec<(u8, u8, f32, f32)> {
+    events
+        .iter()
+        .filter_map(|ev| match *ev {
+            EngineEvent::LayerNote {
+                layer,
+                note,
+                on,
+                off,
+                ..
+            } => Some((layer, note, on, off)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn first_capture_sets_the_loop_length_and_tempo() {
+    let mut e = engine();
+    select_dry(&mut e, "Pixel Pulse");
+    let mut out = Vec::new();
+    // A 4-second phrase: notes at 0 s and 1 s, capture at exactly 4 s.
+    play(&mut e, 60, 9_600, 38_400, &mut out);
+    play(&mut e, 64, 9_600, 134_400, &mut out);
+    e.handle(Cmd::Capture);
+    let events = drain(&mut e);
+    // 4 s fits 2 bars at 120 BPM best (nearest to 110 within 60..160).
+    assert_eq!(
+        events[0],
+        EngineEvent::LoopStarted {
+            steps: 32,
+            bpm: 120.0
+        }
+    );
+    assert!(matches!(
+        events[1],
+        EngineEvent::LayerCaptured {
+            layer: 0,
+            notes: 2,
+            ..
+        }
+    ));
+    let notes = captured_notes(&events);
+    assert_eq!(notes.len(), 2);
+    // 1 s of a 4 s loop of 32 steps is step 8; 0.2 s long is 1.6 steps.
+    assert!((notes[0].2 - 0.0).abs() < 1e-3 && (notes[0].3 - 1.6).abs() < 1e-3);
+    assert!((notes[1].2 - 8.0).abs() < 1e-3);
+    let status = e.shared().status();
+    assert!(status.has_loop && status.running && status.loop_on);
+    assert_eq!(status.loop_steps, 32);
+    assert_eq!(status.layers, 1);
+
+    // The loop starts at the capture: note 1 at once, note 2 one second
+    // later, and the whole loop again four seconds later.
+    out.clear();
+    render(&mut e, 192_000 + 4_800, &mut out);
+    assert_eq!(first_sound(&out), Some(0));
+    assert_eq!(
+        first_sound(&out[28_800 * 2..]).map(|i| i + 28_800),
+        Some(48_000)
+    );
+    assert_eq!(
+        first_sound(&out[110_000 * 2..]).map(|i| i + 110_000),
+        Some(192_000)
+    );
+    assert_clean(&out, "loop");
+}
+
+#[test]
+fn later_captures_take_the_last_pass() {
+    let mut e = engine();
+    select_dry(&mut e, "Pixel Pulse");
+    let mut out = Vec::new();
+    play(&mut e, 60, 9_600, 182_400, &mut out); // 4 s phrase
+    e.handle(Cmd::Capture);
+    drain(&mut e);
+    // Play over the loop: a note 2 s into the pass, then capture after a
+    // full pass. The new layer holds it at step 16 of 32.
+    select(&mut e, "Soft Sine");
+    render(&mut e, 96_000, &mut out);
+    play(&mut e, 67, 24_000, 96_000, &mut out);
+    e.handle(Cmd::Capture);
+    let events = drain(&mut e);
+    let soft_sine = presets::find("Soft Sine").unwrap() as u8;
+    assert!(matches!(
+        events[0],
+        EngineEvent::LayerCaptured { layer: 1, notes: 1, preset } if preset == soft_sine
+    ));
+    let notes = captured_notes(&events);
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0].1, 67);
+    assert!(
+        (notes[0].2 - 16.0).abs() < 1e-3 && (notes[0].3 - 20.0).abs() < 1e-3,
+        "{notes:?}"
+    );
+    assert_eq!(e.shared().status().layers, 0b11);
+
+    // Muting, volume and clearing.
+    e.handle(Cmd::MuteLayer {
+        layer: 1,
+        muted: true,
+    });
+    e.handle(Cmd::LayerVolume {
+        layer: 0,
+        volume: 0.5,
+    });
+    assert_eq!(e.shared().status().muted, 0b10);
+    e.handle(Cmd::ClearLayer(0));
+    e.handle(Cmd::ClearLayer(1));
+    let status = e.shared().status();
+    assert!(!status.has_loop && !status.running && status.layers == 0);
+}
+
+#[test]
+fn capture_explains_why_nothing_was_kept() {
+    let mut e = engine();
+    let mut out = Vec::new();
+    e.handle(Cmd::Capture);
+    assert_eq!(
+        drain(&mut e),
+        vec![EngineEvent::CaptureFailed(CaptureError::Nothing)]
+    );
+    play(&mut e, 60, 4_800, 19_200, &mut out); // 0.5 s phrase
+    e.handle(Cmd::Capture);
+    assert_eq!(
+        drain(&mut e),
+        vec![EngineEvent::CaptureFailed(CaptureError::TooShort)]
+    );
+    // A pause longer than 3 s starts a new phrase: the old note is dropped.
+    render(&mut e, 4 * 48_000, &mut out);
+    play(&mut e, 62, 4_800, 91_200, &mut out);
+    e.handle(Cmd::Capture);
+    let events = drain(&mut e);
+    assert_eq!(captured_notes(&events).len(), 1);
+    // Fill every layer, then one more capture has nowhere to go.
+    // (The loop is 2 s now, so each new note must fall in the last 2 s.)
+    for _ in 1..LAYERS {
+        play(&mut e, 64, 4_800, 48_000, &mut out);
+        e.handle(Cmd::Capture);
+    }
+    drain(&mut e);
+    assert_eq!(e.shared().status().layers, 0xFF);
+    play(&mut e, 64, 4_800, 48_000, &mut out);
+    e.handle(Cmd::Capture);
+    assert_eq!(
+        drain(&mut e),
+        vec![EngineEvent::CaptureFailed(CaptureError::Full)]
+    );
+}
+
+#[test]
+fn loaded_layers_replay_at_their_positions() {
+    let mut e = engine();
+    select(&mut e, "Pixel Pulse");
+    e.shared().reverb.set(0.0);
+    e.handle(Cmd::SetBpm(120.0)); // a step is 6000 samples
+    e.handle(Cmd::SetLoopSteps(16));
+    let preset = presets::find("Pixel Pulse").unwrap() as u8;
+    e.handle(Cmd::BeginLayer {
+        layer: 3,
+        preset,
+        muted: false,
+        volume: 1.0,
+    });
+    e.handle(Cmd::LoadNote {
+        layer: 3,
+        note: 60,
+        velocity: 100,
+        on: 5.0,
+        off: 6.0,
+    });
+    e.handle(Cmd::EndLayer(3));
+    e.handle(Cmd::LoopPlay(true));
+    let mut out = Vec::new();
+    render(&mut e, 96_000 + 40_000, &mut out);
+    // Loaded layers use the sound's own reverb, so look for the attack.
+    let first = first_loud(&out, 0, 0.05).unwrap();
+    let again = first_loud(&out, 60_000, 0.05).unwrap();
+    assert!((30_000..30_064).contains(&first), "{first}");
+    assert_eq!(
+        again - first,
+        96_000,
+        "one loop (16 steps of 6000 samples) later"
+    );
+}
+
+#[test]
+fn arpeggiator_walks_the_scale_in_time() {
+    let mut e = engine();
+    select(&mut e, "Rain Arp"); // up, sixteenth notes, two octaves
+    e.handle(Cmd::SetBpm(120.0));
+    e.handle(Cmd::SetKeyMap(KeyMap {
+        root: 0,
+        scale: Scale::MinorPentatonic,
+        locked: true,
+        octave: 3,
+    }));
+    let mut out = Vec::new();
+    // Hold one key for 3 s (24 sixteenths at 120 BPM) and capture it.
+    e.handle(Cmd::KeyDown {
+        key: 0,
+        velocity: 100,
+    });
+    render(&mut e, 144_000, &mut out);
+    e.handle(Cmd::KeyUp { key: 0 });
+    e.handle(Cmd::Capture);
+    let notes = captured_notes(&drain(&mut e));
+    let pitches: Vec<u8> = notes.iter().map(|n| n.1).collect();
+    // One held key becomes a chord from the scale (C, F, B flat), climbing
+    // through two octaves.
+    assert_eq!(&pitches[..8], &[48, 53, 58, 60, 65, 70, 48, 53]);
+    assert_eq!(notes.len(), 24);
+    // Evenly spaced: 3 s became 1 bar (80 BPM), so a note every 2/3 step.
+    for (i, n) in notes.iter().enumerate() {
+        assert!(
+            (n.2 - i as f32 * 16.0 / 24.0).abs() < 0.01,
+            "arp step {i} at {}",
+            n.2
+        );
+    }
+    for p in &pitches {
+        assert!(
+            [0, 3, 5, 7, 10].contains(&(p % 12)),
+            "{p} is outside the scale"
+        );
+    }
+    assert_clean(&out, "arp");
 }

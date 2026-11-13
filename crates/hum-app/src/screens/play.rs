@@ -1,7 +1,7 @@
 //! Play screen (spec section 3.2).
 
 use eframe::egui::{self, pos2, vec2, Align2, Id, Rect, Stroke};
-use hum_engine::engine::{ATTACK_DEFAULT, RELEASE_DEFAULT, VOLUME_DEFAULT};
+use hum_engine::engine::{Cmd, ATTACK_DEFAULT, RELEASE_DEFAULT, VOLUME_DEFAULT};
 use hum_engine::presets::PRESETS;
 
 use crate::app::{HumApp, Sheet, Tab};
@@ -100,8 +100,10 @@ impl HumApp {
 
         // ---- vertical budget ----------------------------------------------
         let knobs_h = 64.0 + 8.0 + 14.0;
+        let loop_h = 64.0;
         let keys_min = 44.0 + 8.0 + 140.0;
-        let pad_h = (rect.bottom() - y - GAP - knobs_h - GAP - keys_min).clamp(120.0, 232.0);
+        let pad_h =
+            (rect.bottom() - y - GAP - knobs_h - GAP - loop_h - GAP - keys_min).clamp(110.0, 232.0);
 
         // ---- XY pad --------------------------------------------------------
         self.xy_pad(
@@ -116,6 +118,13 @@ impl HumApp {
             Rect::from_min_size(pos2(rect.left(), y), vec2(rect.width(), knobs_h)),
         );
         y += knobs_h + GAP;
+
+        // ---- loop bar --------------------------------------------------------
+        self.loop_bar(
+            &p,
+            Rect::from_min_size(pos2(rect.left(), y), vec2(rect.width(), loop_h)),
+        );
+        y += loop_h + GAP;
 
         // ---- keyboard block ------------------------------------------------
         let stepper = self.octave_stepper(&p, rect.right(), y + 22.0);
@@ -429,6 +438,129 @@ impl HumApp {
                 inter(12.0, 600).tracked(0.04),
                 theme::MUTED,
             );
+        }
+    }
+
+    /// Capture looping without leaving the Play screen: the Loop button,
+    /// a one-tap toggle per layer, play/pause and the playhead.
+    fn loop_bar(&mut self, p: &egui::Painter, rect: Rect) {
+        widgets::surface(p, rect, 22.0, theme::SURFACE, theme::LINE);
+        let cy = rect.center().y;
+        let loop_c = pos2(rect.left() + 6.0 + 26.0, cy);
+        self.loop_button(p, loop_c, 26.0, "play-loop");
+
+        let play_c = pos2(rect.right() - 10.0 - 22.0, cy);
+        let count = self.st.looper.as_ref().map_or(0, |l| l.count());
+        let playing = self.status.loop_on && self.status.running && count > 0;
+        let tap = self.touches.button(
+            Id::unique("play-loop-toggle"),
+            Rect::from_center_size(play_c, vec2(44.0, 44.0)),
+        );
+        widgets::circle(
+            p,
+            play_c,
+            22.0,
+            widgets::pressed(theme::SURFACE_2, tap.down),
+            if playing { theme::VIOLET } else { theme::LINE },
+        );
+        if playing {
+            icons::pause(p, play_c, 22.0, theme::TEXT);
+        } else {
+            let color = if count > 0 {
+                theme::TEXT
+            } else {
+                theme::alpha(theme::MUTED, 0.45)
+            };
+            icons::play(p, play_c + vec2(1.0, 0.0), 22.0, color);
+        }
+        if tap.clicked && count > 0 {
+            self.send(Cmd::LoopPlay(!playing));
+        }
+
+        // Layer dots: 2 rows of 4; tap one to switch that layer on or off.
+        let dot = 18.0;
+        let gap = 7.0;
+        let dots_w = 4.0 * dot + 3.0 * gap;
+        let dots_left = play_c.x - 22.0 - 12.0 - dots_w;
+        for slot in 0..8usize {
+            let c = pos2(
+                dots_left + (slot % 4) as f32 * (dot + gap) + dot / 2.0,
+                cy + if slot < 4 {
+                    -(dot + gap) / 2.0
+                } else {
+                    (dot + gap) / 2.0
+                },
+            );
+            let state = self.layer(slot).map(|l| l.muted);
+            match state {
+                Some(false) => {
+                    p.circle_filled(c, dot / 2.0, crate::screens::layer_color(slot));
+                }
+                Some(true) => {
+                    let stroke = Stroke::new(2.0, crate::screens::layer_color(slot));
+                    p.circle_stroke(c, dot / 2.0 - 1.0, stroke);
+                }
+                None => {
+                    p.circle_stroke(c, dot / 2.0 - 2.0, Stroke::new(1.0, theme::DASHED_EMPTY));
+                }
+            }
+            if state.is_some() {
+                let tap = self.touches.button(
+                    Id::unique(("play-layer", slot)),
+                    Rect::from_center_size(c, vec2(dot + gap, dot + gap)),
+                );
+                if tap.clicked {
+                    self.toggle_layer(slot);
+                }
+            }
+        }
+
+        let text_left = loop_c.x + 26.0 + 10.0;
+        let text_w = dots_left - 8.0 - text_left;
+        let (line1, line2) = match &self.st.looper {
+            None => ("Play, then".to_owned(), "tap Loop".to_owned()),
+            Some(l) => {
+                let bars = l.steps / 16;
+                (
+                    format!("{count} layer{}", if count == 1 { "" } else { "s" }),
+                    format!("{bars} bar{}", if bars == 1 { "" } else { "s" }),
+                )
+            }
+        };
+        let l1 = theme::fit(p, &line1, inter(14.0, 600), text_w);
+        let l2 = theme::fit(p, &line2, inter(12.0, 400), text_w);
+        theme::text(
+            p,
+            pos2(text_left, cy - 1.0),
+            Align2::LEFT_BOTTOM,
+            &l1,
+            inter(14.0, 600),
+            theme::TEXT,
+        );
+        theme::text(
+            p,
+            pos2(text_left, cy + 2.0),
+            Align2::LEFT_TOP,
+            &l2,
+            inter(12.0, 400),
+            theme::MUTED,
+        );
+
+        // Playhead along the bottom edge.
+        if playing {
+            if let Some(l) = &self.st.looper {
+                let f = (self.status.pos / f32::from(l.steps)).clamp(0.0, 1.0);
+                let y = rect.bottom() - 3.0;
+                let (x0, x1) = (rect.left() + 18.0, rect.right() - 18.0);
+                p.line_segment(
+                    [pos2(x0, y), pos2(x1, y)],
+                    Stroke::new(2.0, theme::LINE_FAINT),
+                );
+                p.line_segment(
+                    [pos2(x0, y), pos2(x0 + (x1 - x0) * f, y)],
+                    Stroke::new(2.0, theme::AMBER),
+                );
+            }
         }
     }
 }

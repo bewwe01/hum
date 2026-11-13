@@ -1,6 +1,7 @@
 //! The shared musical clock used by the beat maker, the looper and the
-//! arpeggiator. Positions are measured in sixteenth-note steps; the loop is
-//! four bars (64 steps) long.
+//! arpeggiator. Positions are measured in sixteenth-note steps. The loop
+//! length is set by the first captured loop (1, 2, 4 or 8 bars); with no
+//! loop the clock wraps every four bars.
 
 pub const STEPS_PER_BEAT: usize = 4;
 pub const STEPS_PER_BAR: usize = 16;
@@ -119,8 +120,8 @@ impl Transport {
     }
 
     /// Jump back by one loop length (called exactly at the loop end).
-    pub fn wrap(&mut self) {
-        self.anchor -= LOOP_STEPS as f64;
+    pub fn wrap(&mut self, loop_steps: u32) {
+        self.anchor -= f64::from(loop_steps);
     }
 }
 

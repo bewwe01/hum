@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use hum_engine::engine::{
-    ATTACK_DEFAULT, PAD_X_DEFAULT, PAD_Y_DEFAULT, RELEASE_DEFAULT, VOLUME_DEFAULT,
+    ATTACK_DEFAULT, LAYERS, PAD_X_DEFAULT, PAD_Y_DEFAULT, RELEASE_DEFAULT, VOLUME_DEFAULT,
 };
 use hum_engine::presets::{self, PRESETS};
 use hum_engine::scale::{KeyMap, Scale, DEFAULT_OCTAVE, MAX_OCTAVE, MIN_OCTAVE};
@@ -14,6 +14,74 @@ use serde::{Deserialize, Serialize};
 use crate::audio::BufferMode;
 
 const FILE_NAME: &str = "hum-state.json";
+
+/// One looped note. Positions are in sixteenth steps within the loop; `off`
+/// can be smaller than `on` when the note crosses the loop point.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LoopNote {
+    pub note: u8,
+    pub velocity: u8,
+    pub on: f32,
+    pub off: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LoopLayer {
+    /// Sound name (stable across versions).
+    pub sound: String,
+    pub muted: bool,
+    pub volume: f32,
+    /// Snap notes to the nearest sixteenth when playing back.
+    pub tidy: bool,
+    pub notes: Vec<LoopNote>,
+}
+
+impl Default for LoopLayer {
+    fn default() -> Self {
+        Self {
+            sound: String::new(),
+            muted: false,
+            volume: 1.0,
+            tidy: false,
+            notes: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Looper {
+    /// Loop length in sixteenth steps (16, 32, 64 or 128).
+    pub steps: u16,
+    /// One slot per engine layer.
+    pub layers: Vec<Option<LoopLayer>>,
+    /// Slots in the order they were captured (for undo).
+    pub order: Vec<u8>,
+}
+
+impl Default for Looper {
+    fn default() -> Self {
+        Self {
+            steps: 64,
+            layers: vec![None; LAYERS],
+            order: Vec::new(),
+        }
+    }
+}
+
+impl Looper {
+    pub fn new(steps: u16) -> Self {
+        Self {
+            steps,
+            ..Self::default()
+        }
+    }
+
+    pub fn count(&self) -> usize {
+        self.layers.iter().flatten().count()
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -40,6 +108,8 @@ pub struct Saved {
     pub show_note_names: bool,
     pub haptics: bool,
     pub keep_screen_on: bool,
+    /// The loop layers (None until the first capture).
+    pub looper: Option<Looper>,
 }
 
 impl Default for Saved {
@@ -65,6 +135,7 @@ impl Default for Saved {
             show_note_names: true,
             haptics: true,
             keep_screen_on: false,
+            looper: None,
         }
     }
 }
@@ -96,8 +167,24 @@ impl Saved {
         self.volume = unit(self.volume, d.volume);
         self.pad_x = unit(self.pad_x, d.pad_x);
         self.pad_y = unit(self.pad_y, d.pad_y);
+        if let Some(looper) = &mut self.looper {
+            looper.layers.resize(LAYERS, None);
+            for layer in looper.layers.iter_mut().flatten() {
+                if presets::find(&layer.sound).is_none() {
+                    layer.sound = d.sound.clone();
+                }
+                layer.volume = unit(layer.volume, 1.0);
+                layer
+                    .notes
+                    .retain(|n| n.on.is_finite() && n.off.is_finite());
+            }
+            looper.order.retain(|&i| usize::from(i) < LAYERS);
+            if ![16, 32, 64, 128].contains(&looper.steps) || looper.count() == 0 {
+                self.looper = None;
+            }
+        }
         self.bpm = if self.bpm.is_finite() {
-            self.bpm.round().clamp(MIN_BPM, MAX_BPM)
+            self.bpm.clamp(MIN_BPM, MAX_BPM)
         } else {
             d.bpm
         };

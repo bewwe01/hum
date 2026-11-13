@@ -6,6 +6,7 @@ mod audio;
 mod devshots;
 mod icons;
 mod input;
+mod looping;
 mod platform;
 mod screens;
 mod state;

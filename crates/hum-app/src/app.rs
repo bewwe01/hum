@@ -5,7 +5,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use eframe::egui::{self, pos2, vec2, Align2, Id, Painter, Rect};
-use hum_engine::engine::{Cmd, EngineEvent, RecState, Status, LAYERS};
+use hum_engine::engine::{CaptureError, Cmd, EngineEvent, Status};
 use hum_engine::presets::PRESETS;
 use hum_engine::scale::{Scale, MAX_OCTAVE, MIN_OCTAVE, NOTE_NAMES};
 use hum_engine::transport::{MAX_BPM, MIN_BPM};
@@ -15,7 +15,7 @@ use crate::audio::AudioHost;
 use crate::icons;
 use crate::input::Touches;
 use crate::platform::Platform;
-use crate::state::{Saved, Store};
+use crate::state::{LoopLayer, Looper, Saved, Store};
 use crate::theme::{self, grotesk, inter};
 use crate::watchdog::Stage;
 use crate::widgets;
@@ -69,21 +69,6 @@ pub enum Sheet {
     ConfirmClearAll,
 }
 
-/// One recorded note as drawn on the loop timeline.
-#[derive(Clone, Copy, Debug)]
-pub struct NoteBar {
-    pub note: u8,
-    pub start: f32,
-    pub end: Option<f32>,
-}
-
-/// The UI's picture of a loop layer (the engine owns the real data).
-#[derive(Clone, Debug, Default)]
-pub struct LayerView {
-    pub notes: Vec<NoteBar>,
-    pub sound: usize,
-}
-
 pub struct HumApp {
     pub(crate) platform: Platform,
     pub(crate) hooks: Rc<Hooks>,
@@ -119,8 +104,12 @@ pub struct HumApp {
     pub(crate) category: Option<Category>,
 
     // Loop screen.
-    pub(crate) layers: [LayerView; LAYERS],
-    pub(crate) rec_order: Vec<usize>,
+    /// Layers removed by undo or delete, newest last (slot, layer, steps, bpm).
+    pub(crate) redo: Vec<(usize, LoopLayer, u16, f32)>,
+    /// The Sounds screen is choosing a sound for this loop layer.
+    pub(crate) assign_layer: Option<usize>,
+    /// A short message shown above the tab bar until the given time.
+    pub(crate) toast: Option<(String, f64)>,
 
     // Beats screen.
     pub(crate) drum: usize,
@@ -178,8 +167,9 @@ impl HumApp {
             knob_last_tap: [-10.0; 4],
             search: String::new(),
             category: None,
-            layers: Default::default(),
-            rec_order: Vec::new(),
+            redo: Vec::new(),
+            assign_layer: None,
+            toast: None,
             drum: 0,
             rng: 0x2545_F491,
             bpm_repeat_at: 0.0,
@@ -217,6 +207,13 @@ impl HumApp {
                 bits: *bits,
             });
         }
+        self.send(Cmd::ClearAll);
+        if let Some(looper) = &self.st.looper {
+            self.send(Cmd::SetLoopSteps(looper.steps));
+            for slot in 0..looper.layers.len() {
+                self.send_layer(slot);
+            }
+        }
     }
 
     /// Mirror the pad and knob values into the engine's atomics.
@@ -250,9 +247,6 @@ impl HumApp {
         self.trail.clear();
         self.push_params();
         self.send(Cmd::SetPreset(index as u8));
-        if self.status.rec != RecState::Idle {
-            self.layers[self.status.rec_layer].sound = index;
-        }
     }
 
     /// Play a short preview of the current sound.
@@ -270,7 +264,7 @@ impl HumApp {
     }
 
     pub(crate) fn set_bpm(&mut self, bpm: f32) {
-        let bpm = bpm.round().clamp(MIN_BPM, MAX_BPM);
+        let bpm = bpm.clamp(MIN_BPM, MAX_BPM);
         if bpm != self.st.bpm {
             self.st.bpm = bpm;
             self.send(Cmd::SetBpm(bpm));
@@ -310,20 +304,9 @@ impl HumApp {
             while let Some(e) = audio.poll_event() {
                 events.push(e);
             }
-            let was_recording = self.status.rec != RecState::Idle;
             self.status = audio.shared.status();
-            if !was_recording && self.status.rec != RecState::Idle {
-                // A take started: remember which sound it is recorded with.
-                let layer = self.status.rec_layer;
-                self.layers[layer].sound = self.st.sound_index();
-                self.layers[layer].notes.clear();
-            }
         }
         if reset {
-            for layer in &mut self.layers {
-                layer.notes.clear();
-            }
-            self.rec_order.clear();
             self.sync_engine();
         }
         for e in events {
@@ -350,38 +333,60 @@ impl HumApp {
 
     fn on_engine_event(&mut self, event: EngineEvent) {
         match event {
-            EngineEvent::LoopNote { layer, note, on, t } => {
-                let Some(view) = self.layers.get_mut(layer as usize) else {
-                    return;
-                };
-                if on {
-                    view.notes.push(NoteBar {
-                        note,
-                        start: t,
-                        end: None,
+            EngineEvent::LoopStarted { steps, bpm } => {
+                self.st.bpm = bpm;
+                self.st.looper = Some(Looper::new(steps));
+            }
+            EngineEvent::LayerCaptured { layer, preset, .. } => {
+                let looper = self.st.looper.get_or_insert_with(|| Looper::new(64));
+                let slot = usize::from(layer);
+                if slot < looper.layers.len() {
+                    looper.layers[slot] = Some(LoopLayer {
+                        sound: PRESETS[usize::from(preset).min(PRESETS.len() - 1)]
+                            .name
+                            .to_owned(),
+                        ..LoopLayer::default()
                     });
-                } else if let Some(bar) = view
-                    .notes
-                    .iter_mut()
-                    .rev()
-                    .find(|b| b.note == note && b.end.is_none())
+                    looper.order.retain(|&l| l != layer);
+                    looper.order.push(layer);
+                }
+                self.redo.clear();
+                self.haptic();
+            }
+            EngineEvent::LayerNote {
+                layer,
+                note,
+                velocity,
+                on,
+                off,
+            } => {
+                if let Some(Some(l)) = self
+                    .st
+                    .looper
+                    .as_mut()
+                    .and_then(|lp| lp.layers.get_mut(usize::from(layer)))
                 {
-                    bar.end = Some(t);
+                    l.notes.push(crate::state::LoopNote {
+                        note,
+                        velocity,
+                        on,
+                        off,
+                    });
                 }
             }
-            EngineEvent::RecordDone { layer, kept } => {
-                let layer = layer as usize;
-                if layer >= LAYERS {
-                    return;
-                }
-                if kept {
-                    self.rec_order.retain(|l| *l != layer);
-                    self.rec_order.push(layer);
-                } else {
-                    self.layers[layer].notes.clear();
-                }
+            EngineEvent::CaptureFailed(why) => {
+                let text = match why {
+                    CaptureError::Nothing => "Play something first, then tap Loop",
+                    CaptureError::TooShort => "Play a little longer (at least 1.5 s)",
+                    CaptureError::Full => "All 8 layers are full: delete one first",
+                };
+                self.show_toast(text);
             }
         }
+    }
+
+    pub(crate) fn show_toast(&mut self, text: &str) {
+        self.toast = Some((text.to_owned(), self.now + 2.8));
     }
 
     fn poll_insets(&mut self, ctx: &egui::Context) {
@@ -480,9 +485,17 @@ impl HumApp {
         if self.touches.any_active() || !self.trail.is_empty() || transport_visible {
             ctx.request_repaint();
         }
-        if self.status.rec != RecState::Idle {
-            // Keep draining recorded notes even if the timeline is hidden.
-            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        if self.status.running && self.st.looper.is_some() && self.tab == Tab::Play {
+            // The Loop bar shows the playhead.
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+        if let Some((text, until)) = self.toast.clone() {
+            if self.now < until {
+                self.draw_toast(ui.painter(), safe, &text);
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            } else {
+                self.toast = None;
+            }
         }
 
         #[cfg(not(target_os = "android"))]
@@ -525,6 +538,7 @@ impl HumApp {
             let tap = self.touches.button(Id::unique(("tab", i)), r);
             if tap.clicked && self.tab != *tab {
                 self.tab = *tab;
+                self.assign_layer = None;
             }
             let active = self.tab == *tab;
             if active {
@@ -932,10 +946,8 @@ impl HumApp {
                 }
                 if t2.clicked {
                     self.send(Cmd::ClearAll);
-                    for layer in &mut self.layers {
-                        layer.notes.clear();
-                    }
-                    self.rec_order.clear();
+                    self.st.looper = None;
+                    self.redo.clear();
                     close = true;
                 }
             }
