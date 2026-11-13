@@ -82,10 +82,13 @@ jobs:
         run: |
           command -v cargo-ndk || cargo install cargo-ndk --locked --version "$CARGO_NDK_VERSION"
           export CARGO_PROFILE_RELEASE_DEBUG=line-tables-only
-          cargo ndk --target arm64-v8a --platform "$ANDROID_MIN_SDK" \
+          # x86_64 runs natively on the emulator (arm64 would go through
+          # Android's ARM translation, which behaves differently).
+          rustup target add x86_64-linux-android
+          cargo ndk --target arm64-v8a --target x86_64 --platform "$ANDROID_MIN_SDK" \
             --output-dir android/app/src/main/jniLibs \
             build --package hum-app --lib --release --locked
-          (cd android && ./gradlew --no-daemon assembleDebug -PhumKeepSymbols=true)
+          (cd android && ./gradlew --no-daemon assembleDebug -PhumKeepSymbols=true -PhumAbis=arm64-v8a,x86_64)
 
       - name: Run Hum on the emulator
         timeout-minutes: 15
@@ -134,7 +137,17 @@ jobs:
           timeout 60 "$adb" logcat -d -v threadtime > results/logcat.txt || true
           timeout 20 "$adb" shell dumpsys activity activities > results/activities.txt 2>&1 || true
           echo "== app log lines"
-          grep -E " hum |hum_app|ANR in|FATAL|panicked|watchdog" results/logcat.txt | head -n 80 || true
+          grep -E " hum |hum_app|ANR in|FATAL|panicked|watchdog|RustStdoutStderr|android-activity|platform:" results/logcat.txt | head -n 120 || true
+          echo "== panic context"
+          grep -n -A 30 "panicked" results/logcat.txt | head -n 60 || true
+          echo "== native stacks (first 150 lines)"
+          head -n 150 results/stacks-native.txt 2>/dev/null || true
+          echo "== java main/android_main threads from the ANR trace"
+          for f in results/anr_* results/trace_*; do
+            [ -f "$f" ] && grep -n -A 25 -E '^"(main|android_main)"' "$f" | head -n 80
+          done
+          echo "== resumed activity"
+          grep -E "mResumedActivity|topResumedActivity" results/activities.txt | head -n 5 || true
 
       - name: Upload results
         if: always()

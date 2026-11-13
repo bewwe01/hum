@@ -133,6 +133,7 @@ mod android_worker {
                 .name("hum-platform".into())
                 .spawn(move || {
                     let sdk = AndroidApp::sdk_version();
+                    jni_glue::set_target(app.vm_as_ptr(), app.activity_as_ptr());
                     let mut seen: Vec<Job> = Vec::new();
                     while let Ok(job) = rx.recv() {
                         let first = !seen.contains(&job);
@@ -204,21 +205,30 @@ mod jni_glue {
     /// `WindowInsets.Type`: systemBars() | ime() | displayCutout().
     const INSET_TYPES: i32 = 0x7 | 0x8 | 0x80;
 
+    /// The JavaVM and the Activity (raw pointers), registered by the
+    /// platform thread from `AndroidApp`. (`ndk-context` holds the
+    /// Application, which has no window, so it cannot be used here.)
+    static TARGET: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+
+    pub fn set_target(vm: *mut std::ffi::c_void, activity: *mut std::ffi::c_void) {
+        let _ = TARGET.set((vm as usize, activity as usize));
+    }
+
     /// Run `f` with a JNI environment and the Activity. Any Java exception
     /// is cleared so that a failed call can never crash the app.
     fn with_activity<R>(
         f: impl for<'j> FnOnce(&mut Env<'j>, &JObject<'j>) -> JResult<R>,
     ) -> Option<R> {
-        let ctx = ndk_context::android_context();
-        if ctx.vm().is_null() || ctx.context().is_null() {
+        let &(vm, activity) = TARGET.get()?;
+        if vm == 0 || activity == 0 {
             return None;
         }
-        // SAFETY: android-activity initialised ndk-context with the process's
-        // JavaVM and a global reference to the Activity; both stay valid for
-        // the life of the process.
-        let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) };
-        let raw_activity = ctx.context() as jni::sys::jobject;
-        vm.attach_current_thread(|env: &mut Env<'_>| {
+        // SAFETY: both pointers come from the AndroidApp that the platform
+        // thread keeps alive: the process's JavaVM and a global reference to
+        // the Activity.
+        let vm = unsafe { JavaVM::from_raw(vm as *mut jni::sys::JavaVM) };
+        let raw_activity = activity as jni::sys::jobject;
+        let result = vm.attach_current_thread(|env: &mut Env<'_>| {
             // SAFETY: see above; the reference is a valid global reference.
             let activity = unsafe { JObject::from_raw(env, raw_activity) };
             let result = f(env, &activity);
@@ -226,8 +236,11 @@ mod jni_glue {
                 env.exception_clear();
             }
             result
-        })
-        .ok()
+        });
+        if let Err(err) = &result {
+            log::warn!("platform: JNI call failed: {err}");
+        }
+        result.ok()
     }
 
     fn decor_view<'j>(env: &mut Env<'j>, activity: &JObject<'j>) -> JResult<JObject<'j>> {

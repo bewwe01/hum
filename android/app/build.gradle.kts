@@ -16,7 +16,9 @@ android {
         versionName = prop("humVersionName")
         versionCode = prop("humVersionCode").toInt()
         ndk {
-            abiFilters += "arm64-v8a"
+            // Release builds are arm64-v8a only. The emulator smoke test
+            // passes -PhumAbis=arm64-v8a,x86_64.
+            abiFilters += (providers.gradleProperty("humAbis").orNull ?: "arm64-v8a").split(",")
         }
     }
 
