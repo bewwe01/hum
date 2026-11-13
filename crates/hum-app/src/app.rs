@@ -17,6 +17,7 @@ use crate::input::Touches;
 use crate::platform::Platform;
 use crate::state::{Saved, Store};
 use crate::theme::{self, grotesk, inter};
+use crate::watchdog::Stage;
 use crate::widgets;
 
 /// State shared with the winit lifecycle wrapper in `lib.rs`.
@@ -25,6 +26,7 @@ pub struct Hooks {
     pub audio: RefCell<Option<AudioHost>>,
     /// Set when the app went to the background since the last frame.
     pub was_suspended: Cell<bool>,
+    pub watchdog: crate::watchdog::Watchdog,
     /// Settings changed but not yet written; flushed on suspend and exit.
     pub unsaved: RefCell<Option<(Store, Saved)>>,
 }
@@ -133,6 +135,7 @@ pub struct HumApp {
 impl HumApp {
     pub fn new(cc: &eframe::CreationContext<'_>, platform: Platform, hooks: Rc<Hooks>) -> Self {
         theme::install(&cc.egui_ctx);
+        hooks.watchdog.start();
         let store = Store::new(platform.data_dir());
         let st = store.load();
         log::info!(
@@ -419,9 +422,14 @@ impl HumApp {
     pub(crate) fn frame(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.now = ctx.input(|i| i.time);
+        let watchdog = self.hooks.watchdog.clone();
+        watchdog.enter(Stage::Input);
         self.touches.begin_frame(&ctx);
+        watchdog.enter(Stage::Audio);
         self.pump_audio(&ctx);
+        watchdog.enter(Stage::Insets);
         self.poll_insets(&ctx);
+        watchdog.enter(Stage::Draw);
         self.keyboard_seen = false;
         self.handle_back(&ctx);
 
@@ -461,7 +469,9 @@ impl HumApp {
         if !self.keyboard_seen {
             self.release_all_keys();
         }
+        watchdog.enter(Stage::Save);
         self.autosave(&ctx);
+        watchdog.enter(Stage::Outside);
 
         // Repaint only while something moves or is being touched.
         let transport_visible = self.status.running

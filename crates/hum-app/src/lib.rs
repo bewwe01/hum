@@ -10,6 +10,7 @@ mod platform;
 mod screens;
 mod state;
 mod theme;
+mod watchdog;
 mod widgets;
 
 pub use app::HumApp;
@@ -41,6 +42,7 @@ struct Lifecycle<'a> {
 impl ApplicationHandler<eframe::UserEvent> for Lifecycle<'_> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         log::info!("lifecycle: resumed");
+        self.hooks.watchdog.set_foreground(true);
         // Back in the foreground: reopen the audio stream. (On the very
         // first resume the app does not exist yet; it opens the stream
         // itself when it is created.)
@@ -52,6 +54,7 @@ impl ApplicationHandler<eframe::UserEvent> for Lifecycle<'_> {
 
     fn suspended(&mut self, event_loop: &ActiveEventLoop) {
         log::info!("lifecycle: suspended");
+        self.hooks.watchdog.set_foreground(false);
         // In the background: stop making sound and release the audio device.
         if let Some(audio) = self.hooks.audio.borrow_mut().as_mut() {
             audio.stop();

@@ -20,6 +20,8 @@ pub struct Insets {
 pub struct Platform {
     #[cfg(target_os = "android")]
     app: winit::platform::android::activity::AndroidApp,
+    #[cfg(target_os = "android")]
+    worker: android_worker::Worker,
 }
 
 #[cfg(not(target_os = "android"))]
@@ -54,10 +56,14 @@ impl Platform {
     }
 }
 
+/// Every call into the Android framework runs on one background thread, so
+/// a slow or blocking system call can never freeze the UI. The UI only
+/// queues requests and reads cached results.
 #[cfg(target_os = "android")]
 impl Platform {
     pub fn android(app: winit::platform::android::activity::AndroidApp) -> Self {
-        Self { app }
+        let worker = android_worker::Worker::start(app.clone());
+        Self { app, worker }
     }
 
     /// The app's private files directory (no permission needed).
@@ -69,35 +75,117 @@ impl Platform {
     /// (unlike the Vibrator service) needs no VIBRATE permission. It follows
     /// the system's "touch feedback" setting.
     pub fn haptic_tick(&self) {
-        jni_glue::haptic_tick();
+        self.worker.send(android_worker::Job::Haptic);
     }
 
     pub fn set_keep_screen_on(&self, on: bool) {
-        use winit::platform::android::activity::WindowManagerFlags as Flags;
-        if on {
-            self.app
-                .set_window_flags(Flags::KEEP_SCREEN_ON, Flags::empty());
-        } else {
-            self.app
-                .set_window_flags(Flags::empty(), Flags::KEEP_SCREEN_ON);
-        }
+        self.worker.send(android_worker::Job::KeepScreenOn(on));
     }
 
     /// Ask other media apps to pause while Hum makes sound (and let them
     /// resume when it stops). Needs no permission.
     pub fn set_audio_focus(&self, focused: bool) {
-        jni_glue::audio_focus(focused);
+        self.worker.send(android_worker::Job::AudioFocus(focused));
     }
 
     /// Back on the first screen: send the app to the background, as the
     /// system would for a normal Activity.
     pub fn leave(&self) {
-        jni_glue::move_task_to_back();
+        self.worker.send(android_worker::Job::Leave);
     }
 
+    /// The last measured insets; also queues a fresh measurement.
     pub fn insets(&self) -> Insets {
-        let sdk = winit::platform::android::activity::AndroidApp::sdk_version();
-        jni_glue::insets(sdk).unwrap_or_default()
+        self.worker.send(android_worker::Job::RefreshInsets);
+        self.worker.insets()
+    }
+}
+
+#[cfg(target_os = "android")]
+mod android_worker {
+    use super::{jni_glue, Insets};
+    use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+    use winit::platform::android::activity::{AndroidApp, WindowManagerFlags as Flags};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Job {
+        Haptic,
+        KeepScreenOn(bool),
+        AudioFocus(bool),
+        Leave,
+        RefreshInsets,
+    }
+
+    #[derive(Clone)]
+    pub struct Worker {
+        tx: SyncSender<Job>,
+        insets: Arc<Mutex<Insets>>,
+    }
+
+    impl Worker {
+        pub fn start(app: AndroidApp) -> Self {
+            let (tx, rx) = sync_channel::<Job>(64);
+            let insets = Arc::new(Mutex::new(Insets::default()));
+            let shared = insets.clone();
+            let spawned = std::thread::Builder::new()
+                .name("hum-platform".into())
+                .spawn(move || {
+                    let sdk = AndroidApp::sdk_version();
+                    let mut seen: Vec<Job> = Vec::new();
+                    while let Ok(job) = rx.recv() {
+                        let first = !seen.contains(&job);
+                        if first {
+                            seen.push(job);
+                            log::info!("platform: first {job:?}");
+                        }
+                        let started = Instant::now();
+                        match job {
+                            Job::Haptic => jni_glue::haptic_tick(),
+                            Job::KeepScreenOn(on) => {
+                                if on {
+                                    app.set_window_flags(Flags::KEEP_SCREEN_ON, Flags::empty());
+                                } else {
+                                    app.set_window_flags(Flags::empty(), Flags::KEEP_SCREEN_ON);
+                                }
+                            }
+                            Job::AudioFocus(focused) => jni_glue::audio_focus(focused),
+                            Job::Leave => jni_glue::move_task_to_back(),
+                            Job::RefreshInsets => {
+                                if let Some(value) = jni_glue::insets(sdk) {
+                                    if let Ok(mut slot) = shared.lock() {
+                                        *slot = value;
+                                    }
+                                }
+                            }
+                        }
+                        let took = started.elapsed();
+                        if first {
+                            log::info!("platform: {job:?} done in {} ms", took.as_millis());
+                        } else if took > Duration::from_millis(200) {
+                            log::warn!("platform: {job:?} took {} ms", took.as_millis());
+                        }
+                    }
+                });
+            if let Err(err) = spawned {
+                log::error!("could not start the platform thread: {err}");
+            }
+            Self { tx, insets }
+        }
+
+        /// Queue a job without ever blocking (dropped if the queue is full).
+        pub fn send(&self, job: Job) {
+            match self.tx.try_send(job) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => log::warn!("platform: queue full, dropped {job:?}"),
+                Err(TrySendError::Disconnected(_)) => {}
+            }
+        }
+
+        pub fn insets(&self) -> Insets {
+            self.insets.lock().map(|i| *i).unwrap_or_default()
+        }
     }
 }
 
