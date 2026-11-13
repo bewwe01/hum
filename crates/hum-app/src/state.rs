@@ -137,6 +137,7 @@ impl Saved {
 }
 
 /// Loads and saves [`Saved`].
+#[derive(Clone)]
 pub struct Store {
     path: Option<PathBuf>,
 }

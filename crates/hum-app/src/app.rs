@@ -25,6 +25,18 @@ pub struct Hooks {
     pub audio: RefCell<Option<AudioHost>>,
     /// Set when the app went to the background since the last frame.
     pub was_suspended: Cell<bool>,
+    /// Settings changed but not yet written; flushed on suspend and exit.
+    pub unsaved: RefCell<Option<(Store, Saved)>>,
+}
+
+impl Hooks {
+    /// Write any pending state now (the process may be killed in the
+    /// background without further notice).
+    pub fn flush_save(&self) {
+        if let Some((store, saved)) = self.unsaved.borrow_mut().take() {
+            store.save(&saved);
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -89,6 +101,7 @@ pub struct HumApp {
     next_inset_poll: f64,
     next_reopen: f64,
     screen_on_applied: Option<bool>,
+    focus_applied: bool,
 
     // Keyboard.
     key_of_touch: Vec<(u64, u8)>,
@@ -154,6 +167,7 @@ impl HumApp {
             next_inset_poll: 0.0,
             next_reopen: 0.0,
             screen_on_applied: None,
+            focus_applied: false,
             key_of_touch: Vec::new(),
             key_down: [0; 7],
             keyboard_seen: false,
@@ -314,6 +328,15 @@ impl HumApp {
         }
         self.push_params();
 
+        // Hold audio focus exactly while the output stream is open.
+        let running = self
+            .with_audio(|a| a.is_running() && !a.is_silent())
+            .unwrap_or(false);
+        if running != self.focus_applied {
+            self.platform.set_audio_focus(running);
+            self.focus_applied = running;
+        }
+
         let keep_on = self.st.keep_screen_on;
         if self.screen_on_applied != Some(keep_on) {
             self.platform.set_keep_screen_on(keep_on);
@@ -378,10 +401,11 @@ impl HumApp {
             self.saved = self.st.clone();
             self.last_change = self.now;
             self.save_pending = true;
+            *self.hooks.unsaved.borrow_mut() = Some((self.store.clone(), self.st.clone()));
         }
         if self.save_pending {
             if self.now - self.last_change >= 0.5 {
-                self.store.save(&self.st);
+                self.hooks.flush_save();
                 self.save_pending = false;
             } else {
                 ctx.request_repaint_after(std::time::Duration::from_millis(250));
@@ -399,6 +423,7 @@ impl HumApp {
         self.pump_audio(&ctx);
         self.poll_insets(&ctx);
         self.keyboard_seen = false;
+        self.handle_back(&ctx);
 
         let full = ui.max_rect();
         ui.painter().rect_filled(full, 0.0, theme::BG);
@@ -452,6 +477,26 @@ impl HumApp {
 
         #[cfg(not(target_os = "android"))]
         crate::devshots::drive(self, &ctx);
+    }
+
+    /// Android back (and Escape on desktop): close the sheet, leave
+    /// Settings, return to Play, and finally send the app to the background.
+    fn handle_back(&mut self, ctx: &egui::Context) {
+        let back = ctx
+            .input(|i| i.key_pressed(egui::Key::BrowserBack) || i.key_pressed(egui::Key::Escape));
+        if !back {
+            return;
+        }
+        if self.sheet.is_some() {
+            self.sheet = None;
+        } else if self.settings_open {
+            self.settings_open = false;
+        } else if self.tab != Tab::Play {
+            self.tab = Tab::Play;
+        } else {
+            self.release_all_keys();
+            self.platform.leave();
+        }
     }
 
     // ------------------------------------------------------------------

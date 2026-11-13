@@ -44,6 +44,11 @@ impl Platform {
 
     pub fn set_keep_screen_on(&self, _on: bool) {}
 
+    pub fn set_audio_focus(&self, _focused: bool) {}
+
+    /// The system back action on the first screen. Nothing to do on desktop.
+    pub fn leave(&self) {}
+
     pub fn insets(&self) -> Insets {
         Insets::default()
     }
@@ -76,6 +81,18 @@ impl Platform {
             self.app
                 .set_window_flags(Flags::empty(), Flags::KEEP_SCREEN_ON);
         }
+    }
+
+    /// Ask other media apps to pause while Hum makes sound (and let them
+    /// resume when it stops). Needs no permission.
+    pub fn set_audio_focus(&self, focused: bool) {
+        jni_glue::audio_focus(focused);
+    }
+
+    /// Back on the first screen: send the app to the background, as the
+    /// system would for a normal Activity.
+    pub fn leave(&self) {
+        jni_glue::move_task_to_back();
     }
 
     pub fn insets(&self) -> Insets {
@@ -151,6 +168,61 @@ mod jni_glue {
                 jni_str!("performHapticFeedback"),
                 jni_sig!("(I)Z"),
                 &[JValue::Int(KEYBOARD_TAP)],
+            )?
+            .z()
+        });
+    }
+
+    /// `AudioManager.STREAM_MUSIC` and `AudioManager.AUDIOFOCUS_GAIN`.
+    const STREAM_MUSIC: i32 = 3;
+    const AUDIOFOCUS_GAIN: i32 = 1;
+
+    /// Request or abandon audio focus. This uses the long-standing
+    /// listener-less form: Hum cannot implement a Java listener without Java
+    /// code, and it already goes quiet whenever it leaves the foreground.
+    pub fn audio_focus(focused: bool) {
+        with_activity(|env, activity| {
+            let name = env.new_string("audio")?;
+            let manager = env
+                .call_method(
+                    activity,
+                    jni_str!("getSystemService"),
+                    jni_sig!("(Ljava/lang/String;)Ljava/lang/Object;"),
+                    &[JValue::Object(&name)],
+                )?
+                .l()?;
+            let none = JObject::null();
+            if focused {
+                env.call_method(
+                    &manager,
+                    jni_str!("requestAudioFocus"),
+                    jni_sig!("(Landroid/media/AudioManager$OnAudioFocusChangeListener;II)I"),
+                    &[
+                        JValue::Object(&none),
+                        JValue::Int(STREAM_MUSIC),
+                        JValue::Int(AUDIOFOCUS_GAIN),
+                    ],
+                )?
+                .i()
+            } else {
+                env.call_method(
+                    &manager,
+                    jni_str!("abandonAudioFocus"),
+                    jni_sig!("(Landroid/media/AudioManager$OnAudioFocusChangeListener;)I"),
+                    &[JValue::Object(&none)],
+                )?
+                .i()
+            }
+        });
+    }
+
+    pub fn move_task_to_back() {
+        with_activity(|env, activity| {
+            env.call_method(
+                activity,
+                jni_str!("moveTaskToBack"),
+                jni_sig!("(Z)Z"),
+                &[JValue::Bool(true)],
             )?
             .z()
         });

@@ -57,6 +57,7 @@ impl ApplicationHandler<eframe::UserEvent> for Lifecycle<'_> {
             audio.stop();
         }
         self.hooks.was_suspended.set(true);
+        self.hooks.flush_save();
         self.inner.suspended(event_loop);
     }
 
@@ -91,6 +92,7 @@ impl ApplicationHandler<eframe::UserEvent> for Lifecycle<'_> {
     }
 
     fn exiting(&mut self, event_loop: &ActiveEventLoop) {
+        self.hooks.flush_save();
         self.inner.exiting(event_loop);
     }
 
@@ -119,7 +121,8 @@ fn run(
     if let Err(err) = event_loop.run_app(&mut app) {
         log::error!("event loop ended with an error: {err}");
     }
-    // Close the audio stream before the process winds down.
+    // Save, and close the audio stream, before the process winds down.
+    hooks.flush_save();
     hooks.audio.borrow_mut().take();
 }
 
