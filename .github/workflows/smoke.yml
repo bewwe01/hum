@@ -53,7 +53,12 @@ jobs:
 
       - name: Start the emulator (boots while the app builds)
         run: |
+          # avdmanager and the emulator must agree on where AVDs live.
+          export ANDROID_AVD_HOME="$HOME/.android/avd"
+          echo "ANDROID_AVD_HOME=$ANDROID_AVD_HOME" >> "$GITHUB_ENV"
+          mkdir -p "$ANDROID_AVD_HOME"
           echo no | "$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager" create avd -n smoke -k "$SYSTEM_IMAGE" -d pixel_7 --force
+          "$ANDROID_HOME/emulator/emulator" -list-avds | grep -qx smoke || { echo "::error::AVD was not created"; exit 1; }
           nohup "$ANDROID_HOME/emulator/emulator" -avd smoke -no-window -no-audio -no-boot-anim \
             -no-snapshot -gpu swiftshader_indirect -memory 4096 > emulator.log 2>&1 &
 
