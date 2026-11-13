@@ -121,18 +121,21 @@ ears.
 
 ## Release
 
-See **[docs/RELEASING.md](docs/RELEASING.md)**: how to create the keystore,
-set the four secrets, then `git tag v0.1.0 && git push origin v0.1.0`. The
-release workflow builds, zipaligns, signs and verifies the APK, checks it has
-no permissions, and publishes `hum-<tag>-arm64-v8a.apk` with a `.sha256`.
+**Actions → Release → Run workflow**, then type a version or leave it empty
+to bump the patch number. The workflow builds, zipaligns, signs and verifies
+the APK, checks it has no permissions, creates the tag and publishes
+`hum-<tag>-arm64-v8a.apk` with a `.sha256`. Without signing secrets it signs
+with a temporary key, so you uninstall before each update. With your own
+keystore (see **[docs/RELEASING.md](docs/RELEASING.md)**) updates install in
+place. Pushing a `vX.Y.Z` tag yourself works too.
 
 ## CI
 
 - `.github/workflows/ci.yml`: on pushes to `main`, pull requests and manual
   runs. Runs fmt, clippy, the tests and a debug arm64 APK build, which is
   uploaded as the `hum-debug-arm64-v8a` artifact.
-- `.github/workflows/release.yml`: on `v*.*.*` tags. A manual run is a dry
-  run signed with a throwaway key.
+- `.github/workflows/release.yml`: started from the Actions tab (it
+  creates the tag) or by pushing a `v*.*.*` tag.
 - Third-party actions are pinned to commit SHAs, the default permission is
   `contents: read`, and Dependabot watches the actions and the crates.
 

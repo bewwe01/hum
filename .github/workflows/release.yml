@@ -1,21 +1,39 @@
 name: Release
 
-# Builds, signs and publishes a release APK when a version tag is pushed:
-#   git tag v0.1.0 && git push origin v0.1.0
-# See docs/RELEASING.md for the one-time signing setup.
+# Builds a signed arm64 APK and publishes it as a GitHub Release.
+#
+# Two ways to start it:
+#   1. Actions tab -> Release -> "Run workflow". Enter a version such as
+#      0.2.0, or leave it empty to bump the patch number of the latest
+#      release. The workflow creates the tag itself.
+#   2. Push a tag yourself: git tag v0.2.0 && git push origin v0.2.0
+#
+# Signing: if the four ANDROID_* secrets are set (docs/RELEASING.md), the
+# APK is signed with your keystore and every release installs over the
+# previous one. Without them, a manual run signs with a temporary key made
+# for that run only: uninstall the old version before installing a new one.
+# A tag push always requires the secrets.
 
 on:
   push:
     tags: ["v*.*.*"]
-  # Dry run: builds and signs with a throwaway key, uploads the APK as a
-  # workflow artifact and publishes nothing. Needs no secrets.
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Version, e.g. 0.2.0 (empty = bump the latest release's patch number)"
+        required: false
+        default: ""
+      dry_run:
+        description: "Dry run: build and sign only, publish nothing (the APK becomes a workflow artifact)"
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release
   cancel-in-progress: false
 
 env:
@@ -30,38 +48,61 @@ env:
 
 jobs:
   release:
-    name: Signed arm64 APK
+    name: Build, sign and publish
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
       contents: write
     steps:
-      - name: Check that all signing secrets are set
-        if: github.event_name == 'push'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # tags are needed to work out the next version
+
+      - name: Choose the signing key
+        id: signing
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
-          missing=0
+          missing=""
           for name in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
-            if [ -z "${!name}" ]; then
-              echo "::error::Repository secret $name is not set. See docs/RELEASING.md."
-              missing=1
-            fi
+            [ -n "${!name}" ] || missing="$missing $name"
           done
-          exit "$missing"
+          if [ -z "$missing" ]; then
+            echo "mode=keystore" >> "$GITHUB_OUTPUT"
+            echo "Signing with the keystore from the repository secrets."
+          elif [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            for name in $missing; do
+              echo "::error::Repository secret $name is not set. Tag pushes need all four signing secrets (docs/RELEASING.md), or start the release from the Actions tab to use a temporary key."
+            done
+            exit 1
+          else
+            echo "mode=temporary" >> "$GITHUB_OUTPUT"
+            echo "::warning::No signing secrets set: signing with a temporary key. This APK will not install over a previous Hum build; uninstall that first."
+          fi
 
-      - name: Derive the version from the tag
+      - name: Work out the version
         id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          tag="${GITHUB_REF_NAME}"
-          if [ "$GITHUB_EVENT_NAME" != "push" ]; then
-            tag="v0.0.1"   # dry run
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            tag="$GITHUB_REF_NAME"
+          elif [ -n "$INPUT_VERSION" ]; then
+            tag="v${INPUT_VERSION#v}"
+          else
+            latest="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n 1)"
+            if [ -z "$latest" ]; then
+              tag="v0.1.0"
+            else
+              IFS=. read -r major minor patch <<< "${latest#v}"
+              tag="v$major.$minor.$((patch + 1))"
+            fi
           fi
           if ! [[ "$tag" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
-            echo "::error::Tag '$tag' must look like v1.2.3"
+            echo "::error::Version '$tag' must look like v1.2.3"
             exit 1
           fi
           major="${BASH_REMATCH[1]}"; minor="${BASH_REMATCH[2]}"; patch="${BASH_REMATCH[3]}"
@@ -74,14 +115,16 @@ jobs:
             echo "::error::versionCode must be at least 1 (v0.0.0 is not allowed)"
             exit 1
           fi
+          if [ "$GITHUB_EVENT_NAME" != "push" ] && git rev-parse -q --verify "refs/tags/$tag" > /dev/null; then
+            echo "::error::Tag $tag already exists. Pick a higher version, or leave the field empty to bump automatically."
+            exit 1
+          fi
           {
             echo "tag=$tag"
             echo "name=${tag#v}"
             echo "code=$code"
           } >> "$GITHUB_OUTPUT"
-          echo "versionName=${tag#v} versionCode=$code"
-
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+          echo "Building $tag (versionName ${tag#v}, versionCode $code)"
 
       - name: Select JDK 21
         run: echo "JAVA_HOME=$JAVA_HOME_21_X64" >> "$GITHUB_ENV"
@@ -118,45 +161,48 @@ jobs:
             -PhumVersionName="${{ steps.version.outputs.name }}" \
             -PhumVersionCode="${{ steps.version.outputs.code }}"
 
-      - name: Create a throwaway keystore (dry run only)
-        if: github.event_name != 'push'
-        run: |
-          pass="$(openssl rand -hex 16)"
-          echo "::add-mask::$pass"
-          keytool -genkeypair -keystore "$RUNNER_TEMP/hum-release.jks" -storetype PKCS12 \
-            -alias dryrun -keyalg RSA -keysize 2048 -validity 1 -dname "CN=Hum dry run" \
-            -storepass "$pass" -keypass "$pass" > /dev/null
-          {
-            echo "ANDROID_KEYSTORE_PASSWORD=$pass"
-            echo "ANDROID_KEY_PASSWORD=$pass"
-            echo "ANDROID_KEY_ALIAS=dryrun"
-          } >> "$GITHUB_ENV"
-
       - name: Decode the signing keystore
-        if: github.event_name == 'push'
+        if: steps.signing.outputs.mode == 'keystore'
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
         run: |
           umask 077
           printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/hum-release.jks"
 
+      - name: Create a temporary keystore
+        if: steps.signing.outputs.mode == 'temporary'
+        run: |
+          umask 077
+          pass="$(openssl rand -hex 16)"
+          echo "::add-mask::$pass"
+          keytool -genkeypair -keystore "$RUNNER_TEMP/hum-release.jks" -storetype PKCS12 \
+            -alias hum-temporary -keyalg RSA -keysize 2048 -validity 3650 \
+            -dname "CN=Hum (temporary key)" -storepass "$pass" -keypass "$pass" > /dev/null
+          printf '%s' "$pass" > "$RUNNER_TEMP/hum-temp-pass"
+
       - name: Zipalign, sign and verify
         env:
           SECRET_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           SECRET_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           SECRET_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          MODE: ${{ steps.signing.outputs.mode }}
+          TAG: ${{ steps.version.outputs.tag }}
         run: |
           set -euo pipefail
-          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+          if [ "$MODE" = "keystore" ]; then
             export ANDROID_KEYSTORE_PASSWORD="$SECRET_KEYSTORE_PASSWORD"
             export ANDROID_KEY_ALIAS="$SECRET_KEY_ALIAS"
             export ANDROID_KEY_PASSWORD="$SECRET_KEY_PASSWORD"
+          else
+            ANDROID_KEYSTORE_PASSWORD="$(cat "$RUNNER_TEMP/hum-temp-pass")"
+            export ANDROID_KEYSTORE_PASSWORD
+            export ANDROID_KEY_PASSWORD="$ANDROID_KEYSTORE_PASSWORD"
+            export ANDROID_KEY_ALIAS="hum-temporary"
           fi
-          tag="${{ steps.version.outputs.tag }}"
           mkdir -p dist
           unsigned=android/app/build/outputs/apk/release/app-release-unsigned.apk
           aligned="$RUNNER_TEMP/aligned.apk"
-          out="dist/hum-$tag-arm64-v8a.apk"
+          out="dist/hum-$TAG-arm64-v8a.apk"
           "$BUILD_TOOLS/zipalign" -p -f 4 "$unsigned" "$aligned"
           "$BUILD_TOOLS/apksigner" sign \
             --ks "$RUNNER_TEMP/hum-release.jks" \
@@ -164,36 +210,49 @@ jobs:
             --ks-key-alias "$ANDROID_KEY_ALIAS" \
             --key-pass env:ANDROID_KEY_PASSWORD \
             --out "$out" "$aligned"
-          "$BUILD_TOOLS/apksigner" verify --verbose --print-certs "$out" | grep -v -i "password"
-          (cd dist && sha256sum "hum-$tag-arm64-v8a.apk" > "hum-$tag-arm64-v8a.apk.sha256")
+          "$BUILD_TOOLS/apksigner" verify --verbose --print-certs "$out"
+          (cd dist && sha256sum "hum-$TAG-arm64-v8a.apk" > "hum-$TAG-arm64-v8a.apk.sha256")
           cat dist/*.sha256
 
       - name: Check the APK (no permissions, arm64 only)
         run: ./scripts/check-apk.sh "dist/hum-${{ steps.version.outputs.tag }}-arm64-v8a.apk"
 
-      - name: Upload the dry-run APK
-        if: github.event_name != 'push'
+      - name: Upload the APK as a workflow artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: hum-release-dry-run
+          name: hum-${{ steps.version.outputs.tag }}-arm64-v8a
           path: dist/
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 30
 
-      - name: Create the GitHub release
-        if: github.event_name == 'push'
+      - name: Publish the GitHub release
+        if: github.event_name == 'push' || !inputs.dry_run
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          MODE: ${{ steps.signing.outputs.mode }}
         run: |
-          tag="${{ steps.version.outputs.tag }}"
-          gh release create "$tag" \
+          if [ "$MODE" = "temporary" ]; then
+            notes="**Signed with a temporary key.** This APK will not install over an earlier Hum build: uninstall Hum first (its saved settings and beats are removed with it), then install this one."
+          else
+            notes="Install with \`adb install -r hum-$TAG-arm64-v8a.apk\` or open the APK on the phone. Updates install over the previous version."
+          fi
+          tag_flag=""
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            tag_flag="--verify-tag"
+          fi
+          # On a manual run this also creates the tag, on the commit that was built.
+          gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
-            --title "Hum $tag" \
+            --target "$GITHUB_SHA" \
+            --title "Hum $TAG" \
+            --notes "$notes" \
             --generate-notes \
-            --verify-tag \
-            "dist/hum-$tag-arm64-v8a.apk" \
-            "dist/hum-$tag-arm64-v8a.apk.sha256"
+            $tag_flag \
+            "dist/hum-$TAG-arm64-v8a.apk" \
+            "dist/hum-$TAG-arm64-v8a.apk.sha256"
+          echo "Published: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
 
-      - name: Delete the decoded keystore
+      - name: Delete the keystore
         if: always()
-        run: rm -f "$RUNNER_TEMP/hum-release.jks" "$RUNNER_TEMP/aligned.apk"
+        run: rm -f "$RUNNER_TEMP/hum-release.jks" "$RUNNER_TEMP/hum-temp-pass" "$RUNNER_TEMP/aligned.apk"

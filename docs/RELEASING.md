@@ -1,13 +1,38 @@
 # Releasing Hum
 
 Releases are built, signed and published by
-[`.github/workflows/release.yml`](../.github/workflows/release.yml) when you
-push a tag like `v0.1.0`. You do the one-time signing setup below by hand.
-After that, a release is two commands.
+[`.github/workflows/release.yml`](../.github/workflows/release.yml).
+
+## Quick release: the Actions tab
+
+1. On GitHub, open **Actions → Release → Run workflow**.
+2. Type a version such as `0.2.0`, or leave the field empty to bump the
+   patch number of the latest release (`v0.1.0` becomes `v0.1.1`).
+3. Click **Run workflow**. About five minutes later the release page has
+   `hum-vX.Y.Z-arm64-v8a.apk` and its `.sha256`. The workflow creates the
+   tag itself, on the commit it built.
+
+Tick **Dry run** to build and sign without publishing anything. The APK is
+then only kept as a workflow artifact.
+
+### Temporary key or your own key
+
+- **No signing secrets set (the current setup):** each release is signed with
+  a temporary key made for that run only, and its release notes say so.
+  Android will not install it over an earlier Hum build. **Uninstall Hum
+  first**, which removes its saved settings and beats, then install the new
+  APK.
+- **Signing secrets set (steps 1 and 2 below):** every release is signed with
+  your keystore and installs over the previous one, keeping your settings.
+  The first keystore-signed build still needs one uninstall, because the
+  installed app was signed with a temporary key.
+
+You can also release by pushing a tag yourself (step 3). That route always
+requires the signing secrets.
 
 ---
 
-## 1. One-time: create a signing keystore (on your computer)
+## 1. Optional, one-time: create a signing keystore (on your computer)
 
 > **⚠️ Back up the keystore and its passwords.**
 > **Android only installs an update if it is signed with the same key as the
@@ -44,7 +69,7 @@ base64 -w0 hum-release.jks > hum-release.jks.b64
 base64 -i hum-release.jks -o hum-release.jks.b64
 ```
 
-## 2. One-time: add the four repository secrets
+## 2. Optional, one-time: add the four repository secrets
 
 Using the [GitHub CLI](https://cli.github.com/), run these from inside your
 clone of the repo:
@@ -60,12 +85,13 @@ rm hum-release.jks.b64                    # the .b64 copy is no longer needed
 You can also add them on the web: **Settings → Secrets and variables →
 Actions → New repository secret**.
 
-If any secret is missing, the release job fails at its first step and names
-the missing secret. The workflow never prints secret values. It decodes the
+If the secrets are set, every release uses them. If any is missing, a manual
+run falls back to a temporary key, and a tag push fails at its first step,
+naming the missing secret. The workflow never prints secret values. It decodes the
 keystore into the runner's temp directory and deletes it at the end of the
 job, even when the job fails.
 
-## 3. Cut a release
+## 3. Cut a release by pushing a tag (needs the secrets)
 
 ```sh
 git checkout main && git pull
@@ -88,12 +114,6 @@ The workflow then:
 
 Every new tag must be higher than the last one, because Android refuses
 to install a lower `versionCode` over a higher one.
-
-**Dry run first (optional):** on GitHub, open *Actions → Release → Run
-workflow*. It builds and signs with a throwaway key, uploads the APK as the
-`hum-release-dry-run` artifact and publishes nothing. It needs no secrets.
-A dry-run APK is signed with a different key, so it will not install over a
-real release.
 
 If a release run fails after the tag is pushed, fix the problem, delete the
 tag and push it again:
