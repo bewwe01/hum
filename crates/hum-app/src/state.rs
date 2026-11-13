@@ -110,6 +110,8 @@ pub struct Saved {
     pub keep_screen_on: bool,
     /// The loop layers (None until the first capture).
     pub looper: Option<Looper>,
+    /// How the keyboard area plays (scale keys, piano, chords, drum pads).
+    pub play_mode: crate::keyboard::PlayMode,
 }
 
 impl Default for Saved {
@@ -136,6 +138,7 @@ impl Default for Saved {
             haptics: true,
             keep_screen_on: false,
             looper: None,
+            play_mode: crate::keyboard::PlayMode::Scale,
         }
     }
 }

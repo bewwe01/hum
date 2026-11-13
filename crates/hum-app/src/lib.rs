@@ -7,6 +7,7 @@ mod catalog;
 mod devshots;
 mod icons;
 mod input;
+mod keyboard;
 mod looping;
 mod platform;
 mod screens;

@@ -129,29 +129,15 @@ impl HumApp {
         y += loop_h + GAP;
 
         // ---- keyboard block ------------------------------------------------
-        let stepper = self.octave_stepper(&p, rect.right(), y + 22.0);
-        let helper = if self.st.locked {
-            "Every key fits the scale, so nothing sounds wrong"
+        // Mode switch (Scale / Piano / Chords / Drums) and, except for drum
+        // pads, the octave stepper.
+        let switch_right = if self.st.play_mode == crate::keyboard::PlayMode::Drums {
+            rect.right()
         } else {
-            "Lock is off: the keys play every note in a row"
+            self.octave_stepper(&p, rect.right(), y + 22.0).left() - 10.0
         };
-        let helper_w = stepper.left() - 12.0 - rect.left();
-        let size = {
-            let mut job = egui::text::LayoutJob::single_section(
-                helper.to_owned(),
-                inter(12.0, 400).format(theme::MUTED),
-            );
-            job.wrap.max_width = helper_w;
-            p.layout_job(job).size()
-        };
-        widgets::wrapped(
-            &p,
-            pos2(rect.left(), y + 22.0 - size.y * 0.5),
-            helper_w,
-            helper,
-            inter(12.0, 400),
-            theme::MUTED,
-        );
+        let switch = Rect::from_min_max(pos2(rect.left(), y + 2.0), pos2(switch_right, y + 42.0));
+        self.mode_switch(&p, switch);
         y += 44.0 + 8.0;
         let keys = Rect::from_min_max(pos2(rect.left(), y), rect.max);
         self.keyboard(&p, keys, true);

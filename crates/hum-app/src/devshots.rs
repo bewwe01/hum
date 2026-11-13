@@ -27,7 +27,7 @@ const NAMES: [&str; 10] = [
     "play-looped",
     "beats",
     "settings",
-    "sheet-scale",
+    "play-drums",
     "sheet-key",
 ];
 
@@ -52,8 +52,9 @@ fn arrange(app: &mut HumApp, step: usize) {
         0 => app.tab = Tab::Play,
         1 => {
             app.tab = Tab::Play;
-            app.key_down[2] = 1;
-            app.key_down[4] = 1;
+            app.st.play_mode = crate::keyboard::PlayMode::Piano;
+            app.zone_down[2] = 1;
+            app.zone_down[9] = 1;
             app.st.pad_x = 0.68;
             app.st.pad_y = 0.62;
             let now = app.now;
@@ -68,7 +69,7 @@ fn arrange(app: &mut HumApp, step: usize) {
                 .collect();
         }
         2 => {
-            app.key_down = [0; 7];
+            app.zone_down = [0; crate::keyboard::MAX_ZONES];
             app.trail.clear();
             app.tab = Tab::Sounds;
         }
@@ -122,7 +123,10 @@ fn arrange(app: &mut HumApp, step: usize) {
             app.send(Cmd::LoopPlay(true));
             app.tab = Tab::Loop;
         }
-        5 => app.tab = Tab::Play,
+        5 => {
+            app.st.play_mode = crate::keyboard::PlayMode::Chords;
+            app.tab = Tab::Play;
+        }
         6 => {
             app.send(Cmd::BeatPlay(true));
             app.tab = Tab::Beats;
@@ -133,8 +137,8 @@ fn arrange(app: &mut HumApp, step: usize) {
             app.settings_open = true;
         }
         8 => {
+            app.st.play_mode = crate::keyboard::PlayMode::Drums;
             app.tab = Tab::Play;
-            app.sheet = Some(Sheet::Scale);
         }
         _ => {
             app.tab = Tab::Play;

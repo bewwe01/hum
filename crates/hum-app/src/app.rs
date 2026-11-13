@@ -13,6 +13,7 @@ use crate::audio::AudioHost;
 use crate::catalog::{self, Catalog, Group, Instrument};
 use crate::icons;
 use crate::input::Touches;
+use crate::keyboard::{Held, PlayMode, MAX_ZONES};
 use crate::platform::Platform;
 use crate::state::{LoopLayer, Looper, Saved, Store};
 use crate::theme::{self, grotesk, inter};
@@ -90,9 +91,10 @@ pub struct HumApp {
     focus_applied: bool,
 
     // Keyboard.
-    key_of_touch: Vec<(u64, u8)>,
-    pub(crate) key_down: [u8; 7],
-    keyboard_seen: bool,
+    pub(crate) zone_of_touch: Vec<(u64, usize)>,
+    pub(crate) zone_down: [u8; MAX_ZONES],
+    pub(crate) zone_held: [Held; MAX_ZONES],
+    pub(crate) keyboard_seen: bool,
 
     // Play screen.
     pub(crate) trail: Vec<(f32, f32, f64)>,
@@ -162,8 +164,9 @@ impl HumApp {
             next_reopen: 0.0,
             screen_on_applied: None,
             focus_applied: false,
-            key_of_touch: Vec::new(),
-            key_down: [0; 7],
+            zone_of_touch: Vec::new(),
+            zone_down: [0; MAX_ZONES],
+            zone_held: [Held::default(); MAX_ZONES],
             keyboard_seen: false,
             trail: Vec::new(),
             knob_last_tap: [-10.0; 4],
@@ -253,6 +256,12 @@ impl HumApp {
         self.trail.clear();
         self.push_params();
         self.send(Cmd::SetSound(inst.sound));
+        // Drum kits get drum pads; leaving a kit goes back to the scale keys.
+        if inst.drums {
+            self.st.play_mode = PlayMode::Drums;
+        } else if self.st.play_mode == PlayMode::Drums {
+            self.st.play_mode = PlayMode::Scale;
+        }
     }
 
     /// Play a short preview of the current sound.
@@ -269,6 +278,7 @@ impl HumApp {
     }
 
     pub(crate) fn set_keymap_changed(&mut self) {
+        self.release_all_keys();
         self.send(Cmd::SetKeyMap(self.st.keymap()));
     }
 
@@ -631,114 +641,6 @@ impl HumApp {
             theme::MUTED,
         );
         rect
-    }
-
-    /// The seven-key keyboard (Play and Loop screens). Multi-touch: every
-    /// finger plays the key under it, and sliding plays each new key.
-    pub(crate) fn keyboard(&mut self, p: &Painter, rect: Rect, root_dots: bool) {
-        self.keyboard_seen = true;
-        let id = Id::unique("keyboard");
-        self.touches.claim(id, rect);
-        let gap = 6.0;
-        let key_w = (rect.width() - gap * 6.0) / 7.0;
-        let key_at = |x: f32| -> u8 {
-            (((x - rect.left() + gap * 0.5) / (key_w + gap)).floor() as i32).clamp(0, 6) as u8
-        };
-
-        // Work out which key each finger is on now.
-        let touches: Vec<(u64, f32, bool)> = self
-            .touches
-            .owned(id)
-            .map(|t| (t.id, t.pos.x, t.ended))
-            .collect();
-        for (touch, x, ended) in touches {
-            let current = self.key_of_touch.iter().position(|(t, _)| *t == touch);
-            if ended {
-                if let Some(i) = current {
-                    let (_, key) = self.key_of_touch.swap_remove(i);
-                    self.key_release(key);
-                }
-                continue;
-            }
-            let key = key_at(x);
-            match current {
-                Some(i) if self.key_of_touch[i].1 == key => {}
-                Some(i) => {
-                    let old = self.key_of_touch[i].1;
-                    self.key_of_touch[i].1 = key;
-                    self.key_press(key);
-                    self.key_release(old);
-                }
-                None => {
-                    self.key_of_touch.push((touch, key));
-                    self.key_press(key);
-                }
-            }
-        }
-
-        let map = self.st.keymap();
-        for key in 0..7u8 {
-            let r = Rect::from_min_size(
-                pos2(rect.left() + f32::from(key) * (key_w + gap), rect.top()),
-                vec2(key_w, rect.height()),
-            );
-            let down = self.key_down[key as usize] > 0;
-            let note = map.note(i32::from(key));
-            if down {
-                widgets::glow(p, r, 16.0, theme::alpha(theme::VIOLET, 0.55), 26.0);
-                widgets::surface(p, r, 16.0, theme::VIOLET, theme::VIOLET_LIGHT);
-            } else {
-                widgets::surface(p, r, 16.0, theme::SURFACE_2, theme::LINE);
-            }
-            if self.st.show_note_names && r.height() > 44.0 {
-                let (style, color) = if down {
-                    (grotesk(15.0, 700), theme::ON_VIOLET)
-                } else {
-                    (grotesk(15.0, 600), theme::TEXT)
-                };
-                widgets::note_label(
-                    p,
-                    pos2(r.center().x, r.bottom() - 12.0),
-                    Align2::CENTER_BOTTOM,
-                    note,
-                    style,
-                    color,
-                );
-            }
-            if root_dots && map.is_root(i32::from(key)) {
-                let color = if down { theme::ON_VIOLET } else { theme::AMBER };
-                p.circle_filled(pos2(r.center().x, r.top() + 14.0), 4.0, color);
-            }
-        }
-    }
-
-    fn key_press(&mut self, key: u8) {
-        let count = &mut self.key_down[key as usize];
-        *count += 1;
-        if *count == 1 {
-            self.send(Cmd::KeyDown { key, velocity: 100 });
-            self.haptic();
-        }
-    }
-
-    fn key_release(&mut self, key: u8) {
-        let count = &mut self.key_down[key as usize];
-        if *count > 0 {
-            *count -= 1;
-            if *count == 0 {
-                self.send(Cmd::KeyUp { key });
-            }
-        }
-    }
-
-    pub(crate) fn release_all_keys(&mut self) {
-        self.key_of_touch.clear();
-        for key in 0..7u8 {
-            if self.key_down[key as usize] > 0 {
-                self.key_down[key as usize] = 0;
-                self.send(Cmd::KeyUp { key });
-            }
-        }
     }
 
     /// The octave stepper: minus, numeral, plus. `right` is its right edge.
