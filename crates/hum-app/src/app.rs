@@ -6,12 +6,11 @@ use std::rc::Rc;
 
 use eframe::egui::{self, pos2, vec2, Align2, Id, Painter, Rect};
 use hum_engine::engine::{CaptureError, Cmd, EngineEvent, Status};
-use hum_engine::presets::PRESETS;
 use hum_engine::scale::{Scale, MAX_OCTAVE, MIN_OCTAVE, NOTE_NAMES};
 use hum_engine::transport::{MAX_BPM, MIN_BPM};
-use hum_engine::Category;
 
 use crate::audio::AudioHost;
+use crate::catalog::{self, Catalog, Group, Instrument};
 use crate::icons;
 use crate::input::Touches;
 use crate::platform::Platform;
@@ -101,7 +100,9 @@ pub struct HumApp {
 
     // Sounds screen.
     pub(crate) search: String,
-    pub(crate) category: Option<Category>,
+    pub(crate) category: Option<Group>,
+    /// Every playable sound (synth presets, then SoundFont instruments).
+    pub(crate) catalog: Catalog,
 
     // Loop screen.
     /// Layers removed by undo or delete, newest last (slot, layer, steps, bpm).
@@ -135,7 +136,8 @@ impl HumApp {
                 .map_or("none".to_owned(), |p| p.display().to_string())
         );
 
-        let mut audio = AudioHost::new(cc.egui_ctx.clone());
+        let loader = platform.clone();
+        let mut audio = AudioHost::new(cc.egui_ctx.clone(), move || loader.load_soundfont());
         audio.set_mode(st.buffer);
         audio.start();
         *hooks.audio.borrow_mut() = Some(audio);
@@ -167,6 +169,7 @@ impl HumApp {
             knob_last_tap: [-10.0; 4],
             search: String::new(),
             category: None,
+            catalog: Catalog::new(),
             redo: Vec::new(),
             assign_layer: None,
             toast: None,
@@ -197,7 +200,7 @@ impl HumApp {
     /// whenever a fresh engine was created).
     fn sync_engine(&mut self) {
         self.push_params();
-        self.send(Cmd::SetPreset(self.st.sound_index() as u8));
+        self.send(Cmd::SetSound(self.instrument().sound));
         self.send(Cmd::SetKeyMap(self.st.keymap()));
         self.send(Cmd::SetBpm(self.st.bpm));
         self.send(Cmd::Metronome(self.st.metronome));
@@ -229,29 +232,35 @@ impl HumApp {
         }
     }
 
-    pub(crate) fn preset(&self) -> &'static hum_engine::Preset {
-        &PRESETS[self.st.sound_index()]
+    /// The live instrument.
+    pub(crate) fn instrument(&self) -> Instrument {
+        self.catalog.get(&self.st.sound)
     }
 
-    /// Select a sound and reset the pad and knobs to its defaults.
+    /// Select catalog entry `index` and reset the pad and knobs to its
+    /// defaults.
     pub(crate) fn select_sound(&mut self, index: usize) {
-        let index = index.min(PRESETS.len() - 1);
-        let p = &PRESETS[index];
+        let Some(inst) = self.catalog.items.get(index).cloned() else {
+            return;
+        };
         self.release_all_keys();
-        self.st.sound = p.name.to_owned();
+        self.st.sound = inst.key.clone();
         self.st.attack = hum_engine::engine::ATTACK_DEFAULT;
         self.st.release = hum_engine::engine::RELEASE_DEFAULT;
-        self.st.reverb = p.reverb;
+        self.st.reverb = inst.reverb;
         self.st.pad_x = hum_engine::engine::PAD_X_DEFAULT;
         self.st.pad_y = hum_engine::engine::PAD_Y_DEFAULT;
         self.trail.clear();
         self.push_params();
-        self.send(Cmd::SetPreset(index as u8));
+        self.send(Cmd::SetSound(inst.sound));
     }
 
     /// Play a short preview of the current sound.
     pub(crate) fn preview(&self) {
-        let note = if self.preset().category == Category::Bass {
+        let inst = self.instrument();
+        let note = if inst.drums {
+            38
+        } else if inst.low {
             48
         } else {
             60
@@ -301,6 +310,10 @@ impl HumApp {
             }
             audio.log_stream_once();
             reset = audio.take_engine_reset();
+            if let Some(presets) = audio.poll_soundfont() {
+                self.catalog.add_soundfont(&presets);
+            }
+            audio.deliver_synth();
             while let Some(e) = audio.poll_event() {
                 events.push(e);
             }
@@ -337,14 +350,12 @@ impl HumApp {
                 self.st.bpm = bpm;
                 self.st.looper = Some(Looper::new(steps));
             }
-            EngineEvent::LayerCaptured { layer, preset, .. } => {
+            EngineEvent::LayerCaptured { layer, sound, .. } => {
                 let looper = self.st.looper.get_or_insert_with(|| Looper::new(64));
                 let slot = usize::from(layer);
                 if slot < looper.layers.len() {
                     looper.layers[slot] = Some(LoopLayer {
-                        sound: PRESETS[usize::from(preset).min(PRESETS.len() - 1)]
-                            .name
-                            .to_owned(),
+                        sound: catalog::key_for_sound(sound),
                         ..LoopLayer::default()
                     });
                     looper.order.retain(|&l| l != layer);

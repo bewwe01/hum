@@ -81,7 +81,7 @@ pub fn render(spec: &RenderSpec) -> Rendered {
     shared.pad_y.set(spec.pad_y);
     shared.reverb.set(p.reverb);
     let mut engine = Engine::new(sr, shared);
-    engine.handle(Cmd::SetPreset(spec.preset as u8));
+    engine.handle(Cmd::SetSound(spec.preset as u16));
     // Put the requested note on the first key so arpeggios start from it.
     engine.handle(Cmd::SetKeyMap(KeyMap {
         root: spec.note % 12,
@@ -112,9 +112,20 @@ pub fn render(spec: &RenderSpec) -> Rendered {
         engine.handle(Cmd::NoteOff { note: spec.note });
     }
 
-    // Render the tail until it has been quiet for 300 ms.
+    finish(&mut engine, samples, hold_frames, spec.max_tail, p.amp.a)
+}
+
+/// Render the release tail until 300 ms of quiet, then measure.
+fn finish(
+    engine: &mut Engine,
+    mut samples: Vec<f32>,
+    hold_frames: usize,
+    max_tail: f32,
+    attack: f32,
+) -> Rendered {
+    let sr = SAMPLE_RATE as f32;
     let quiet_needed = (0.3 * sr) as usize;
-    let max_tail = (spec.max_tail * sr) as usize;
+    let max_tail = (max_tail * sr) as usize;
     let mut quiet = 0usize;
     let mut tail_frames = 0usize;
     let mut block = [0.0f32; 512];
@@ -128,12 +139,11 @@ pub fn render(spec: &RenderSpec) -> Rendered {
         samples.extend_from_slice(&block);
         tail_frames += block.len() / 2;
     }
-
     let end = analysis::last_above(&samples, AUDIBLE);
     let mono = analysis::to_mono(&samples);
     let held = &mono[..hold_frames.max(4096).min(mono.len())];
     // Skip the attack so slow pads are measured at full level.
-    let skip = ((p.amp.a * sr) as usize).min(held.len() / 2);
+    let skip = ((attack * sr) as usize).min(held.len() / 2);
     let stats = Stats {
         peak: analysis::peak(&samples),
         rms: analysis::rms(&samples[..end * 2]),
@@ -146,6 +156,47 @@ pub fn render(spec: &RenderSpec) -> Rendered {
         hold_frames,
         stats,
     }
+}
+
+/// Path of the bundled SoundFont (GeneralUser GS).
+pub fn soundfont_path() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../assets/soundfonts/GeneralUser-GS.sf2")
+}
+
+pub fn load_soundfont() -> std::io::Result<Arc<rustysynth::SoundFont>> {
+    let mut file = std::fs::File::open(soundfont_path())?;
+    rustysynth::SoundFont::new(&mut file)
+        .map(Arc::new)
+        .map_err(|e| std::io::Error::other(format!("{e:?}")))
+}
+
+/// Render one note of SoundFont preset `bank:program`.
+pub fn render_gm(
+    sf: &Arc<rustysynth::SoundFont>,
+    bank: u16,
+    program: u16,
+    note: u8,
+    hold: f32,
+) -> Rendered {
+    let sr = SAMPLE_RATE as f32;
+    let shared = Arc::new(Shared::default());
+    let mut engine = Engine::new(sr, shared);
+    let settings = rustysynth::SynthesizerSettings::new(SAMPLE_RATE as i32);
+    let synth = rustysynth::Synthesizer::new(sf, &settings).expect("synthesizer");
+    engine.set_synth(Box::new(synth));
+    engine.handle(Cmd::SetSound(hum_engine::engine::sf_sound(bank, program)));
+    let hold_frames = (hold * sr) as usize;
+    let mut samples = vec![0.0f32; hold_frames * 2];
+    engine.handle(Cmd::NoteOn {
+        note,
+        velocity: 100,
+    });
+    for chunk in samples.chunks_mut(512) {
+        engine.process(chunk);
+    }
+    engine.handle(Cmd::NoteOff { note });
+    finish(&mut engine, samples, hold_frames, 8.0, 0.0)
 }
 
 /// File-system friendly name, e.g. "08-warm-cloud".

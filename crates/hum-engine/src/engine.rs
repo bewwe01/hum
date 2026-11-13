@@ -10,6 +10,8 @@
 use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::Arc;
 
+use rustysynth::Synthesizer;
+
 use crate::dsp::{smooth_coef, Rng, TAU};
 use crate::fx::{Chorus, Delay, Limiter, Reverb};
 use crate::preset::{ArpPattern, Preset};
@@ -21,6 +23,21 @@ use crate::transport::{
 use crate::voice::{BlockCtx, Buses, Macros, Voice, MAX_BLOCK};
 
 pub const VOICES: usize = 24;
+
+/// Identifies a sound: values below [`SF_BASE`] index the synth preset
+/// table, values from [`SF_BASE`] select a SoundFont preset
+/// (`SF_BASE + bank * 128 + program`).
+pub type SoundId = u16;
+pub const SF_BASE: SoundId = 1024;
+
+pub const fn sf_sound(bank: u16, program: u16) -> SoundId {
+    SF_BASE + bank * 128 + program
+}
+
+/// SoundFont output level relative to the synth voices.
+const SF_GAIN: f32 = 7.0;
+/// MIDI channels used for SoundFont parts: the live part and 8 layers.
+const SF_CHANNELS: usize = 9;
 pub const LAYERS: usize = 8;
 /// Maximum number of events (note-ons plus note-offs) in one loop layer.
 pub const LAYER_CAPACITY: usize = 1024;
@@ -213,8 +230,8 @@ pub enum Cmd {
     },
     /// Release everything that is sounding (fast fade).
     AllNotesOff,
-    /// Select the live sound (index into the preset table).
-    SetPreset(u8),
+    /// Select the live sound.
+    SetSound(SoundId),
     /// Play a short preview of the live sound at the given MIDI note.
     Preview {
         note: u8,
@@ -238,9 +255,9 @@ pub enum Cmd {
         layer: u8,
         volume: f32,
     },
-    LayerPreset {
+    LayerSound {
         layer: u8,
-        preset: u8,
+        sound: SoundId,
     },
     /// Set the loop length in steps (0 = no loop). Used when restoring.
     SetLoopSteps(u16),
@@ -248,7 +265,7 @@ pub enum Cmd {
     /// then EndLayer. Positions are in steps within the loop.
     BeginLayer {
         layer: u8,
-        preset: u8,
+        sound: SoundId,
         muted: bool,
         volume: f32,
     },
@@ -289,7 +306,7 @@ pub enum EngineEvent {
     /// A layer was captured; `notes` LayerNote events follow.
     LayerCaptured {
         layer: u8,
-        preset: u8,
+        sound: SoundId,
         notes: u16,
     },
     /// One captured note; positions in steps within the loop. `off` may be
@@ -320,7 +337,7 @@ struct Layer {
     cursor: usize,
     active: bool,
     muted: bool,
-    preset: u8,
+    sound: SoundId,
     volume: f32,
 }
 
@@ -335,7 +352,7 @@ struct HistEvent {
     note: u8,
     /// 0 = note-off.
     velocity: u8,
-    preset: u8,
+    sound: SoundId,
 }
 
 /// A note assembled during a capture.
@@ -345,7 +362,7 @@ struct CapNote {
     off: f64,
     note: u8,
     velocity: u8,
-    preset: u8,
+    sound: SoundId,
     open: bool,
 }
 
@@ -367,7 +384,7 @@ impl Layer {
             cursor: 0,
             active: false,
             muted: false,
-            preset: 0,
+            sound: 0,
             volume: 1.0,
         }
     }
@@ -425,7 +442,7 @@ pub struct Engine {
     volume: f32,
     rng: Rng,
 
-    live_preset: u8,
+    live_sound: SoundId,
     keymap: KeyMap,
     /// Note currently sounding for each key slot.
     keys: [Option<u8>; KEY_SLOTS],
@@ -462,6 +479,14 @@ pub struct Engine {
 
     events: [EngineEvent; EVENT_QUEUE],
     events_len: usize,
+
+    /// SoundFont player (handed over once the bank has loaded).
+    sf: Option<Box<Synthesizer>>,
+    /// Sound and controller values last sent to each SoundFont channel.
+    sf_sound: [SoundId; SF_CHANNELS],
+    sf_cc: [[i32; 3]; SF_CHANNELS],
+    sf_left: [f32; MAX_BLOCK],
+    sf_right: [f32; MAX_BLOCK],
 }
 
 impl Engine {
@@ -476,7 +501,7 @@ impl Engine {
             .map(|i| Voice::new(0x1234_5678 ^ (i as u32 * 7919 + 1)))
             .collect();
         let drum_presets = presets::BEAT_DRUMS.map(|name| presets::find(name).unwrap_or(0) as u8);
-        let live_preset = presets::DEFAULT_PRESET as u8;
+        let live_sound = presets::DEFAULT_PRESET as SoundId;
         let mut engine = Self {
             sample_rate,
             shared,
@@ -489,7 +514,7 @@ impl Engine {
             limiter: Limiter::new(sample_rate),
             volume: 0.0,
             rng: Rng::new(0xC0FF_EE11),
-            live_preset,
+            live_sound,
             keymap: KeyMap::default(),
             keys: [None; KEY_SLOTS],
             macros: [Macros::NEUTRAL; PARTS],
@@ -516,7 +541,7 @@ impl Engine {
                     epoch: 0,
                     note: 0,
                     velocity: 0,
-                    preset: 0
+                    sound: 0
                 };
                 HISTORY
             ]
@@ -529,7 +554,7 @@ impl Engine {
                     off: 0.0,
                     note: 0,
                     velocity: 0,
-                    preset: 0,
+                    sound: 0,
                     open: false
                 };
                 CAP_NOTES
@@ -540,6 +565,11 @@ impl Engine {
             click_env: 0.0,
             events: [EngineEvent::CaptureFailed(CaptureError::Nothing); EVENT_QUEUE],
             events_len: 0,
+            sf: None,
+            sf_sound: [SoundId::MAX; SF_CHANNELS],
+            sf_cc: [[-1; 3]; SF_CHANNELS],
+            sf_left: [0.0; MAX_BLOCK],
+            sf_right: [0.0; MAX_BLOCK],
         };
         engine.volume = volume_gain(engine.shared.volume.get());
         engine.macros[PART_LIVE as usize] = engine.live_targets();
@@ -556,8 +586,20 @@ impl Engine {
         &self.shared
     }
 
-    pub fn live_preset(&self) -> &'static Preset {
-        &PRESETS[self.live_preset as usize]
+    /// The live sound's synth preset (None for a SoundFont sound).
+    pub fn live_synth(&self) -> Option<&'static Preset> {
+        PRESETS.get(usize::from(self.live_sound))
+    }
+
+    /// Install the SoundFont player; returns the previous one, if any.
+    pub fn set_synth(&mut self, synth: Box<Synthesizer>) -> Option<Box<Synthesizer>> {
+        self.sf_sound = [SoundId::MAX; SF_CHANNELS];
+        self.sf_cc = [[-1; 3]; SF_CHANNELS];
+        self.sf.replace(synth)
+    }
+
+    pub fn has_soundfont(&self) -> bool {
+        self.sf.is_some()
     }
 
     pub fn bpm(&self) -> f32 {
@@ -598,20 +640,22 @@ impl Engine {
                 for v in self.voices.iter_mut() {
                     v.kill();
                 }
+                if let Some(sf) = self.sf.as_mut() {
+                    sf.note_off_all(false);
+                }
             }
-            Cmd::SetPreset(index) => {
-                let index = (index as usize).min(PRESETS.len() - 1) as u8;
-                if index != self.live_preset {
+            Cmd::SetSound(sound) => {
+                if sound != self.live_sound {
                     self.release_live();
-                    self.live_preset = index;
+                    self.live_sound = sound;
                     self.update_delay();
                 }
             }
             Cmd::Preview { note } => {
                 self.key_up(PREVIEW_KEY);
                 self.key_down(PREVIEW_KEY, 100, Some(note.min(127)));
-                let p = self.live_preset();
-                let seconds = if p.arp.is_some() { 1.6 } else { 0.45 };
+                let arp = self.live_synth().is_some_and(|p| p.arp.is_some());
+                let seconds = if arp { 1.6 } else { 0.6 };
                 self.preview_off = (seconds * self.sample_rate) as u64;
             }
             Cmd::SetKeyMap(map) => self.keymap = map,
@@ -659,9 +703,9 @@ impl Engine {
                     self.macros[PART_LAYER0 as usize + layer as usize].gain = l.volume;
                 }
             }
-            Cmd::LayerPreset { layer, preset } => {
+            Cmd::LayerSound { layer, sound } => {
                 if (layer as usize) < LAYERS {
-                    self.layers[layer as usize].preset = preset.min(PRESETS.len() as u8 - 1);
+                    self.layers[layer as usize].sound = sound;
                     self.release_part(PART_LAYER0 + layer);
                 }
             }
@@ -675,7 +719,7 @@ impl Engine {
             }
             Cmd::BeginLayer {
                 layer,
-                preset,
+                sound,
                 muted,
                 volume,
             } => {
@@ -685,7 +729,7 @@ impl Engine {
                     l.active = false;
                     l.len = 0;
                     l.cursor = 0;
-                    l.preset = preset.min(PRESETS.len() as u8 - 1);
+                    l.sound = sound;
                     l.muted = muted;
                     l.volume = volume.clamp(0.0, 1.5);
                     self.macros[PART_LAYER0 as usize + layer as usize] = Macros {
@@ -751,9 +795,10 @@ impl Engine {
     }
 
     fn update_delay(&mut self) {
-        let p = self.live_preset();
-        self.delay
-            .set(p.delay_beats, self.transport.bpm(), p.delay_feedback);
+        let (beats, feedback) = self
+            .live_synth()
+            .map_or((0.75, 0.3), |p| (p.delay_beats, p.delay_feedback));
+        self.delay.set(beats, self.transport.bpm(), feedback);
     }
 
     fn ensure_running(&mut self) {
@@ -804,7 +849,7 @@ impl Engine {
         let velocity = velocity.clamp(1, 127);
         let note = fixed_note.unwrap_or_else(|| self.keymap.note(key as i32));
         self.keys[key] = Some(note);
-        if self.live_preset().arp.is_some() {
+        if self.live_synth().is_some_and(|p| p.arp.is_some()) {
             let was_idle = !self.arp.any_held();
             self.arp.held[key] = true;
             self.arp.velocity = velocity;
@@ -854,7 +899,7 @@ impl Engine {
     }
 
     fn live_on(&mut self, note: u8, velocity: u8) {
-        self.note_on(PART_LIVE, self.live_preset, note, velocity);
+        self.note_on(PART_LIVE, self.live_sound, note, velocity);
         self.remember(note, velocity);
     }
 
@@ -880,7 +925,7 @@ impl Engine {
             epoch: self.epoch,
             note,
             velocity,
-            preset: self.live_preset,
+            sound: self.live_sound,
         };
         self.history[self.hist_head] = event;
         self.hist_head = (self.hist_head + 1) % HISTORY;
@@ -894,7 +939,7 @@ impl Engine {
     }
 
     fn arp_step(&mut self) {
-        let Some(arp) = self.live_preset().arp else {
+        let Some(arp) = self.live_synth().and_then(|p| p.arp) else {
             self.arp.next = NEVER;
             return;
         };
@@ -1017,8 +1062,12 @@ impl Engine {
     // ------------------------------------------------------------------
     // Voices
 
-    fn note_on(&mut self, part: u8, preset: u8, note: u8, velocity: u8) {
-        let preset = &PRESETS[(preset as usize).min(PRESETS.len() - 1)];
+    fn note_on(&mut self, part: u8, sound: SoundId, note: u8, velocity: u8) {
+        if sound >= SF_BASE {
+            self.sf_note_on(part, sound, note, velocity);
+            return;
+        }
+        let preset = &PRESETS[usize::from(sound).min(PRESETS.len() - 1)];
         // Prefer a free voice, then the oldest released one, then the oldest.
         let mut best = 0usize;
         let mut best_rank = (3u8, u64::MAX);
@@ -1048,12 +1097,66 @@ impl Engine {
                 v.note_off();
             }
         }
+        if let Some(sf) = self.sf.as_mut() {
+            if usize::from(part) < SF_CHANNELS {
+                sf.note_off(i32::from(part), i32::from(note));
+            }
+        }
     }
 
     fn release_part(&mut self, part: u8) {
         for v in self.voices.iter_mut() {
             if v.active && v.gate && v.part == part {
                 v.note_off();
+            }
+        }
+        if let Some(sf) = self.sf.as_mut() {
+            if usize::from(part) < SF_CHANNELS {
+                sf.note_off_all_channel(i32::from(part), false);
+            }
+        }
+    }
+
+    /// Play a SoundFont note on the part's channel, switching the channel's
+    /// bank and program first if needed.
+    fn sf_note_on(&mut self, part: u8, sound: SoundId, note: u8, velocity: u8) {
+        let ch = usize::from(part);
+        let Some(sf) = self.sf.as_mut() else { return };
+        if ch >= SF_CHANNELS {
+            return;
+        }
+        if self.sf_sound[ch] != sound {
+            let rel = i32::from(sound - SF_BASE);
+            sf.note_off_all_channel(ch as i32, false);
+            sf.process_midi_message(ch as i32, 0xB0, 0x00, rel / 128);
+            sf.process_midi_message(ch as i32, 0xC0, rel % 128, 0);
+            self.sf_sound[ch] = sound;
+        }
+        sf.note_on(ch as i32, i32::from(note), i32::from(velocity));
+    }
+
+    /// Mirror volume, reverb and modulation into the SoundFont channels.
+    fn sf_controls(&mut self) {
+        let Some(sf) = self.sf.as_mut() else { return };
+        for ch in 0..SF_CHANNELS {
+            let m = &self.macros[ch];
+            let volume = if ch == 0 {
+                1.0
+            } else {
+                self.layers[ch - 1].volume
+            };
+            let reverb = if m.reverb >= 0.0 { m.reverb } else { 0.3 };
+            let wobble = if ch == 0 { m.wobble } else { 0.0 };
+            let values = [
+                (volume * 100.0).round().clamp(0.0, 127.0) as i32,
+                (reverb * 127.0).round().clamp(0.0, 127.0) as i32,
+                (wobble * 100.0).round().clamp(0.0, 127.0) as i32,
+            ];
+            for (k, cc) in [0x07, 0x5B, 0x01].into_iter().enumerate() {
+                if self.sf_cc[ch][k] != values[k] {
+                    sf.process_midi_message(ch as i32, 0xB0, cc, values[k]);
+                    self.sf_cc[ch][k] = values[k];
+                }
             }
         }
     }
@@ -1076,7 +1179,7 @@ impl Engine {
                         off: to,
                         note: e.note,
                         velocity: e.velocity,
-                        preset: e.preset,
+                        sound: e.sound,
                         open: true,
                     };
                     count += 1;
@@ -1174,11 +1277,11 @@ impl Engine {
         };
 
         let steps = f64::from(self.loop_steps);
-        let first_preset = self.cap[0].preset;
+        let first_sound = self.cap[0].sound;
         let live_macros = self.macros[PART_LIVE as usize];
         let layer = &mut self.layers[slot];
         layer.len = 0;
-        layer.preset = first_preset;
+        layer.sound = first_sound;
         layer.muted = false;
         layer.volume = 1.0;
         for n in &self.cap[..count] {
@@ -1211,7 +1314,7 @@ impl Engine {
         self.loop_on = true;
         self.emit(EngineEvent::LayerCaptured {
             layer: slot as u8,
-            preset: first_preset,
+            sound: first_sound,
             notes: count as u16,
         });
         for i in 0..count {
@@ -1250,7 +1353,12 @@ impl Engine {
             for drum in 0..DRUMS {
                 if self.patterns[drum] >> in_bar & 1 == 1 {
                     let velocity = if in_bar.is_multiple_of(4) { 112 } else { 96 };
-                    self.note_on(PART_DRUMS, self.drum_presets[drum], 60, velocity);
+                    self.note_on(
+                        PART_DRUMS,
+                        SoundId::from(self.drum_presets[drum]),
+                        60,
+                        velocity,
+                    );
                 }
             }
         }
@@ -1300,7 +1408,7 @@ impl Engine {
                     if e.velocity == 0 {
                         self.note_off(part, e.note);
                     } else if self.loop_on && !self.layers[i].muted {
-                        self.note_on(part, self.layers[i].preset, e.note, e.velocity);
+                        self.note_on(part, self.layers[i].sound, e.note, e.velocity);
                     }
                 }
             }
@@ -1367,6 +1475,7 @@ impl Engine {
     pub fn process(&mut self, out: &mut [f32]) {
         let frames = out.len() / 2;
         let targets = self.live_targets();
+        self.sf_controls();
         let volume_target = volume_gain(self.shared.volume.get());
         let volume_coef = smooth_coef(0.02, 1.0 / self.sample_rate);
         let click_decay = (-1.0 / (0.018 * self.sample_rate)).exp();
@@ -1404,6 +1513,13 @@ impl Engine {
                 if v.active {
                     ctx.macros = self.macros[(v.part as usize).min(PARTS - 1)];
                     v.render(n, &ctx, &mut self.buses, 0);
+                }
+            }
+            if let Some(sf) = self.sf.as_mut() {
+                sf.render(&mut self.sf_left[..n], &mut self.sf_right[..n]);
+                for i in 0..n {
+                    self.buses.dry[i][0] += self.sf_left[i] * SF_GAIN;
+                    self.buses.dry[i][1] += self.sf_right[i] * SF_GAIN;
                 }
             }
 

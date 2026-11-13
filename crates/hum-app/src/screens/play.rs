@@ -2,7 +2,6 @@
 
 use eframe::egui::{self, pos2, vec2, Align2, Id, Rect, Stroke};
 use hum_engine::engine::{Cmd, ATTACK_DEFAULT, RELEASE_DEFAULT, VOLUME_DEFAULT};
-use hum_engine::presets::PRESETS;
 
 use crate::app::{HumApp, Sheet, Tab};
 use crate::icons;
@@ -35,16 +34,16 @@ impl HumApp {
             vec2(36.0, 36.0),
         );
         p.rect_filled(tile, 12.0, theme::SURFACE_3);
-        let preset = self.preset();
+        let inst = self.instrument();
         icons::wave(
             &p,
             Rect::from_center_size(tile.center(), vec2(22.0, 12.0)),
-            preset.main_wave(),
+            inst.wave,
             theme::VIOLET,
         );
         let text_x = tile.right() + 12.0;
         let text_w = picker.right() - 40.0 - text_x;
-        let name = theme::fit(&p, preset.name, grotesk(18.0, 600), text_w);
+        let name = theme::fit(&p, &inst.name, grotesk(18.0, 600), text_w);
         theme::text(
             &p,
             pos2(text_x, picker.top() + 8.0),
@@ -53,12 +52,15 @@ impl HumApp {
             grotesk(18.0, 600),
             theme::TEXT,
         );
-        let subtitle = format!(
-            "{} · {} of {}",
-            preset.category.name(),
-            self.st.sound_index() + 1,
-            PRESETS.len()
-        );
+        let subtitle = match self.catalog.index_of(&inst.key) {
+            Some(i) => format!(
+                "{} · {} of {}",
+                inst.group.name(),
+                i + 1,
+                self.catalog.items.len()
+            ),
+            None => inst.group.name().to_owned(),
+        };
         theme::text(
             &p,
             pos2(text_x, picker.bottom() - 9.0),
@@ -389,7 +391,7 @@ impl HumApp {
         let defaults = [
             ATTACK_DEFAULT,
             RELEASE_DEFAULT,
-            self.preset().reverb,
+            self.instrument().reverb,
             VOLUME_DEFAULT,
         ];
         for i in 0..4 {

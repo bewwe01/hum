@@ -44,6 +44,19 @@ impl Platform {
 
     pub fn haptic_tick(&self) {}
 
+    /// Parse the bundled SoundFont (from the repository's assets folder).
+    pub fn load_soundfont(&self) -> crate::audio::LoadedSoundFont {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../assets/soundfonts/GeneralUser-GS.sf2"
+        );
+        let file = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
+        let mut reader = std::io::BufReader::new(file);
+        rustysynth::SoundFont::new(&mut reader)
+            .map(std::sync::Arc::new)
+            .map_err(|e| format!("{e:?}"))
+    }
+
     pub fn set_keep_screen_on(&self, _on: bool) {}
 
     pub fn set_audio_focus(&self, _focused: bool) {}
@@ -69,6 +82,19 @@ impl Platform {
     /// The app's private files directory (no permission needed).
     pub fn data_dir(&self) -> Option<PathBuf> {
         self.app.internal_data_path()
+    }
+
+    /// Parse the SoundFont packaged in the APK's assets.
+    pub fn load_soundfont(&self) -> crate::audio::LoadedSoundFont {
+        let asset = self
+            .app
+            .asset_manager()
+            .open(c"GeneralUser-GS.sf2")
+            .ok_or("GeneralUser-GS.sf2 is missing from the APK assets")?;
+        let mut reader = std::io::BufReader::with_capacity(1 << 20, asset);
+        rustysynth::SoundFont::new(&mut reader)
+            .map(std::sync::Arc::new)
+            .map_err(|e| format!("{e:?}"))
     }
 
     /// A short key-press buzz through `View.performHapticFeedback`, which

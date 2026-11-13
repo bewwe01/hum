@@ -31,6 +31,14 @@ android {
         }
     }
 
+    // The SoundFont (GeneralUser GS) ships as an APK asset; the Rust code
+    // opens it through the AssetManager.
+    sourceSets {
+        getByName("main") {
+            assets.srcDirs("../../assets/soundfonts")
+        }
+    }
+
     lint {
         checkReleaseBuilds = false
         abortOnError = false

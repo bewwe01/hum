@@ -19,9 +19,10 @@ use std::time::Duration;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
 use hum_engine::engine::{Cmd, Engine, EngineEvent, Shared};
+use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
 use serde::{Deserialize, Serialize};
 
-const CMD_QUEUE: usize = 1024;
+const CMD_QUEUE: usize = 8192;
 const EVENT_QUEUE: usize = 8192;
 const PREFERRED_RATE: u32 = 48_000;
 /// Frames rendered per engine call inside the callback.
@@ -76,7 +77,24 @@ struct EngineSlot {
     engine: Engine,
     cmds: rtrb::Consumer<Cmd>,
     events: rtrb::Producer<EngineEvent>,
+    synths: rtrb::Consumer<Box<Synthesizer>>,
 }
+
+impl EngineSlot {
+    /// Apply queued commands and adopt a newly delivered SoundFont player.
+    /// Real-time safe: a player is only ever delivered once per engine.
+    fn take_messages(&mut self) {
+        if let Ok(synth) = self.synths.pop() {
+            let _ = self.engine.set_synth(synth);
+        }
+        while let Ok(cmd) = self.cmds.pop() {
+            self.engine.handle(cmd);
+        }
+    }
+}
+
+/// The result of loading the bundled SoundFont.
+pub type LoadedSoundFont = Result<Arc<SoundFont>, String>;
 
 /// Returns the engine to the UI thread when the audio callback is dropped.
 struct SlotGuard {
@@ -97,6 +115,13 @@ pub struct AudioHost {
     pub info: Arc<StreamInfo>,
     cmds: rtrb::Producer<Cmd>,
     events: rtrb::Consumer<EngineEvent>,
+    synths: rtrb::Producer<Box<Synthesizer>>,
+    /// The current engine already has a SoundFont player.
+    synth_sent: bool,
+    /// Sample rate of the current engine.
+    slot_rate: f32,
+    soundfont: Option<Arc<SoundFont>>,
+    soundfont_rx: Option<mpsc::Receiver<LoadedSoundFont>>,
     home_tx: mpsc::Sender<Box<EngineSlot>>,
     home_rx: mpsc::Receiver<Box<EngineSlot>>,
     parked: Option<Box<EngineSlot>>,
@@ -113,30 +138,73 @@ pub struct AudioHost {
     last_error: Option<String>,
 }
 
-fn new_slot(
-    sample_rate: f32,
-    shared: &Arc<Shared>,
-) -> (EngineSlot, rtrb::Producer<Cmd>, rtrb::Consumer<EngineEvent>) {
+struct SlotEnds {
+    cmds: rtrb::Producer<Cmd>,
+    events: rtrb::Consumer<EngineEvent>,
+    synths: rtrb::Producer<Box<Synthesizer>>,
+}
+
+fn new_slot(sample_rate: f32, shared: &Arc<Shared>) -> (EngineSlot, SlotEnds) {
     let (cmd_tx, cmd_rx) = rtrb::RingBuffer::new(CMD_QUEUE);
     let (event_tx, event_rx) = rtrb::RingBuffer::new(EVENT_QUEUE);
+    let (synth_tx, synth_rx) = rtrb::RingBuffer::new(1);
     let slot = EngineSlot {
         engine: Engine::new(sample_rate, shared.clone()),
         cmds: cmd_rx,
         events: event_tx,
+        synths: synth_rx,
     };
-    (slot, cmd_tx, event_rx)
+    (
+        slot,
+        SlotEnds {
+            cmds: cmd_tx,
+            events: event_rx,
+            synths: synth_tx,
+        },
+    )
 }
 
 impl AudioHost {
-    pub fn new(repaint: egui::Context) -> Self {
+    /// `load_soundfont` runs on a background thread; until it finishes only
+    /// the synth sounds can play.
+    pub fn new(
+        repaint: egui::Context,
+        load_soundfont: impl FnOnce() -> LoadedSoundFont + Send + 'static,
+    ) -> Self {
         let shared = Arc::new(Shared::default());
-        let (slot, cmds, events) = new_slot(PREFERRED_RATE as f32, &shared);
+        let (slot, ends) = new_slot(PREFERRED_RATE as f32, &shared);
         let (home_tx, home_rx) = mpsc::channel();
+        let (sf_tx, sf_rx) = mpsc::channel();
+        let wake = repaint.clone();
+        let spawned = std::thread::Builder::new()
+            .name("hum-soundfont".into())
+            .spawn(move || {
+                let started = std::time::Instant::now();
+                let result = load_soundfont();
+                match &result {
+                    Ok(sf) => log::info!(
+                        "SoundFont loaded: {} presets in {} ms",
+                        sf.get_presets().len(),
+                        started.elapsed().as_millis()
+                    ),
+                    Err(err) => log::error!("SoundFont not loaded: {err}"),
+                }
+                let _ = sf_tx.send(result);
+                wake.request_repaint();
+            });
+        if let Err(err) = spawned {
+            log::error!("could not start the SoundFont loader: {err}");
+        }
         Self {
             shared,
             info: Arc::new(StreamInfo::default()),
-            cmds,
-            events,
+            cmds: ends.cmds,
+            events: ends.events,
+            synths: ends.synths,
+            synth_sent: false,
+            slot_rate: PREFERRED_RATE as f32,
+            soundfont: None,
+            soundfont_rx: Some(sf_rx),
             home_tx,
             home_rx,
             parked: Some(Box::new(slot)),
@@ -169,6 +237,48 @@ impl AudioHost {
 
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
+    }
+
+    /// Once the SoundFont has loaded: returns its preset list (bank,
+    /// program, name) exactly once, for the instrument catalog.
+    pub fn poll_soundfont(&mut self) -> Option<Vec<(u16, u16, String)>> {
+        let rx = self.soundfont_rx.as_ref()?;
+        let result = rx.try_recv().ok()?;
+        self.soundfont_rx = None;
+        let sf = result.ok()?;
+        let presets = sf
+            .get_presets()
+            .iter()
+            .filter_map(|p| {
+                let bank = u16::try_from(p.get_bank_number()).ok()?;
+                let program = u16::try_from(p.get_patch_number()).ok()?;
+                Some((bank, program, p.get_name().to_owned()))
+            })
+            .collect();
+        self.soundfont = Some(sf);
+        self.synth_sent = false;
+        Some(presets)
+    }
+
+    /// Give the current engine a SoundFont player if it has none yet. The
+    /// player is built here (allocation) and only moved to the audio thread.
+    pub fn deliver_synth(&mut self) {
+        if self.synth_sent {
+            return;
+        }
+        let Some(sf) = &self.soundfont else { return };
+        let settings = SynthesizerSettings::new(self.slot_rate.round() as i32);
+        match Synthesizer::new(sf, &settings) {
+            Ok(synth) => {
+                if self.synths.push(Box::new(synth)).is_ok() {
+                    self.synth_sent = true;
+                }
+            }
+            Err(err) => {
+                log::error!("could not create the SoundFont player: {err:?}");
+                self.synth_sent = true;
+            }
+        }
     }
 
     /// Queue a command for the engine. Never blocks.
@@ -368,9 +478,12 @@ impl AudioHost {
         match self.parked.take() {
             Some(slot) if (slot.engine.sample_rate() - sample_rate).abs() < 0.5 => slot,
             _ => {
-                let (slot, cmds, events) = new_slot(sample_rate, &self.shared);
-                self.cmds = cmds;
-                self.events = events;
+                let (slot, ends) = new_slot(sample_rate, &self.shared);
+                self.cmds = ends.cmds;
+                self.events = ends.events;
+                self.synths = ends.synths;
+                self.synth_sent = false;
+                self.slot_rate = sample_rate;
                 self.engine_reset = true;
                 Box::new(slot)
             }
@@ -399,9 +512,7 @@ impl AudioHost {
             let Some(slot) = guard.slot.as_mut() else {
                 return;
             };
-            while let Ok(cmd) = slot.cmds.pop() {
-                slot.engine.handle(cmd);
-            }
+            slot.take_messages();
             let frames = data.len() / channels;
             let mut done = 0;
             while done < frames {
@@ -501,9 +612,7 @@ impl NullOutput {
                 let Some(slot) = guard.slot.as_mut() else {
                     break;
                 };
-                while let Ok(cmd) = slot.cmds.pop() {
-                    slot.engine.handle(cmd);
-                }
+                slot.take_messages();
                 // Keep pace with the wall clock.
                 let due = start.elapsed().as_secs_f64() * f64::from(PREFERRED_RATE);
                 while (rendered as f64) < due {

@@ -32,6 +32,8 @@ OPTIONS:
   --hold <SECS>    How long the key is held
   --x <0..1>       XY pad brightness (default 0.5)
   --y <0..1>       XY pad wobble (default 0.3)
+  --gm <BANK:PROG> Render a SoundFont instrument instead, e.g. 0:0 (piano)
+  --gm-survey      Render a spread of SoundFont instruments and print levels
   --list           List the sounds and exit";
 
 #[derive(Default)]
@@ -45,6 +47,8 @@ struct Args {
     x: Option<f32>,
     y: Option<f32>,
     list: bool,
+    gm: Option<(u16, u16)>,
+    gm_survey: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -71,6 +75,19 @@ fn parse_args() -> Result<Args, String> {
             "--x" => args.x = Some(value("--x")?.parse().map_err(|e| format!("--x: {e}"))?),
             "--y" => args.y = Some(value("--y")?.parse().map_err(|e| format!("--y: {e}"))?),
             "--list" => args.list = true,
+            "--gm" => {
+                let v = value("--gm")?;
+                let (b, p) = v
+                    .split_once(':')
+                    .ok_or("--gm wants BANK:PROGRAM, e.g. 0:0")?;
+                let b: u16 = b.parse().map_err(|e| format!("--gm bank: {e}"))?;
+                let p: u16 = p.parse().map_err(|e| format!("--gm program: {e}"))?;
+                if b > 128 || p > 127 {
+                    return Err("--gm bank must be 0..=128 and program 0..=127".to_owned());
+                }
+                args.gm = Some((b, p));
+            }
+            "--gm-survey" => args.gm_survey = true,
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument '{other}'")),
         }
@@ -121,6 +138,64 @@ fn row(index: usize, spec: &RenderSpec, r: &Rendered) {
 
 fn run() -> Result<(), String> {
     let args = parse_args()?;
+    if args.gm.is_some() || args.gm_survey {
+        let sf = hum_tools::render::load_soundfont()
+            .map_err(|e| format!("cannot load the SoundFont: {e}"))?;
+        let list: Vec<(u16, u16)> = match args.gm {
+            Some(one) => vec![one],
+            None => vec![
+                (0, 0),
+                (0, 4),
+                (0, 11),
+                (0, 19),
+                (0, 24),
+                (0, 33),
+                (0, 40),
+                (0, 48),
+                (0, 52),
+                (0, 56),
+                (0, 65),
+                (0, 73),
+                (0, 80),
+                (0, 88),
+                (128, 0),
+            ],
+        };
+        println!(
+            "{:>9}  {:<24} {:>8} {:>8}",
+            "bank:prg", "name", "peak dB", "RMS dB"
+        );
+        for (bank, program) in list {
+            let note = if bank == 128 {
+                38
+            } else {
+                args.note.unwrap_or(60)
+            };
+            let r =
+                hum_tools::render::render_gm(&sf, bank, program, note, args.hold.unwrap_or(1.5));
+            let name = sf
+                .get_presets()
+                .iter()
+                .find(|p| {
+                    p.get_bank_number() == i32::from(bank)
+                        && p.get_patch_number() == i32::from(program)
+                })
+                .map_or("?", |p| p.get_name());
+            println!(
+                "{:>9}  {:<24} {:>8.1} {:>8.1}",
+                format!("{bank}:{program}"),
+                name,
+                db(r.stats.peak),
+                db(r.stats.rms)
+            );
+            if let Some(out) = &args.out {
+                wav::write(out, &r.samples, 2, SAMPLE_RATE)
+                    .map_err(|e| format!("cannot write {}: {e}", out.display()))?;
+                println!("\nWrote {}", out.display());
+            }
+        }
+        return Ok(());
+    }
     if args.list {
         for (i, p) in PRESETS.iter().enumerate() {
             println!("{:>2}  {:<14} {}", i + 1, p.name, p.category.name());

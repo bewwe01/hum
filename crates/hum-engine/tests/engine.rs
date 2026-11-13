@@ -20,7 +20,7 @@ fn engine() -> Engine {
 
 fn select(e: &mut Engine, name: &str) {
     let index = presets::find(name).unwrap_or_else(|| panic!("no preset {name}"));
-    e.handle(Cmd::SetPreset(index as u8));
+    e.handle(Cmd::SetSound(index as u16));
     e.shared().reverb.set(PRESETS[index].reverb);
 }
 
@@ -91,7 +91,7 @@ fn all_56_presets_render_bounded_non_silent_audio() {
     assert_eq!(PRESETS.len(), 56);
     for (index, p) in PRESETS.iter().enumerate() {
         let mut e = engine();
-        e.handle(Cmd::SetPreset(index as u8));
+        e.handle(Cmd::SetSound(index as u16));
         e.shared().reverb.set(p.reverb);
         let mut out = Vec::new();
         // Play through the keys so Arps sounds arpeggiate.
@@ -118,7 +118,7 @@ fn output_stays_below_0_dbfs_under_abuse() {
     // the beat running: the limiter must hold.
     for (index, p) in PRESETS.iter().enumerate() {
         let mut e = engine();
-        e.handle(Cmd::SetPreset(index as u8));
+        e.handle(Cmd::SetSound(index as u16));
         let s = e.shared().clone();
         s.volume.set(1.0);
         s.reverb.set(1.0);
@@ -153,7 +153,7 @@ fn output_stays_below_0_dbfs_under_abuse() {
 fn note_off_reaches_silence_and_frees_voices() {
     for (index, p) in PRESETS.iter().enumerate() {
         let mut e = engine();
-        e.handle(Cmd::SetPreset(index as u8));
+        e.handle(Cmd::SetSound(index as u16));
         e.shared().reverb.set(p.reverb);
         let mut out = Vec::new();
         e.handle(Cmd::KeyDown {
@@ -345,7 +345,7 @@ fn changing_sound_while_holding_keys_leaves_nothing_stuck() {
     let mut e = engine();
     let mut out = Vec::new();
     for round in 0..PRESETS.len() {
-        e.handle(Cmd::SetPreset(round as u8));
+        e.handle(Cmd::SetSound(round as u16));
         e.handle(Cmd::KeyDown {
             key: (round % 7) as u8,
             velocity: 100,
@@ -353,7 +353,7 @@ fn changing_sound_while_holding_keys_leaves_nothing_stuck() {
         e.handle(Cmd::Preview { note: 60 });
         render(&mut e, 2_400, &mut out);
     }
-    e.handle(Cmd::SetPreset(0));
+    e.handle(Cmd::SetSound(0));
     for key in 0..7 {
         e.handle(Cmd::KeyUp { key });
     }
@@ -487,10 +487,10 @@ fn later_captures_take_the_last_pass() {
     play(&mut e, 67, 24_000, 96_000, &mut out);
     e.handle(Cmd::Capture);
     let events = drain(&mut e);
-    let soft_sine = presets::find("Soft Sine").unwrap() as u8;
+    let soft_sine = presets::find("Soft Sine").unwrap() as u16;
     assert!(matches!(
         events[0],
-        EngineEvent::LayerCaptured { layer: 1, notes: 1, preset } if preset == soft_sine
+        EngineEvent::LayerCaptured { layer: 1, notes: 1, sound } if sound == soft_sine
     ));
     let notes = captured_notes(&events);
     assert_eq!(notes.len(), 1);
@@ -561,10 +561,10 @@ fn loaded_layers_replay_at_their_positions() {
     e.shared().reverb.set(0.0);
     e.handle(Cmd::SetBpm(120.0)); // a step is 6000 samples
     e.handle(Cmd::SetLoopSteps(16));
-    let preset = presets::find("Pixel Pulse").unwrap() as u8;
+    let sound = presets::find("Pixel Pulse").unwrap() as u16;
     e.handle(Cmd::BeginLayer {
         layer: 3,
-        preset,
+        sound,
         muted: false,
         volume: 1.0,
     });
@@ -631,4 +631,55 @@ fn arpeggiator_walks_the_scale_in_time() {
         );
     }
     assert_clean(&out, "arp");
+}
+
+/// The bundled GeneralUser GS bank, parsed once per test.
+fn soundfont() -> Arc<rustysynth::SoundFont> {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../assets/soundfonts/GeneralUser-GS.sf2"
+    );
+    let mut file = std::fs::File::open(path).expect("bundled SoundFont");
+    Arc::new(rustysynth::SoundFont::new(&mut file).expect("valid SoundFont"))
+}
+
+fn engine_with_soundfont() -> Engine {
+    let mut e = engine();
+    let settings = rustysynth::SynthesizerSettings::new(SR as i32);
+    let synth = rustysynth::Synthesizer::new(&soundfont(), &settings).expect("synthesizer");
+    e.set_synth(Box::new(synth));
+    e
+}
+
+#[test]
+fn soundfont_instruments_play_and_loop() {
+    use hum_engine::engine::sf_sound;
+    let mut e = engine_with_soundfont();
+    let mut out = Vec::new();
+    // Grand piano (bank 0, program 0), then a drum kit (bank 128).
+    e.handle(Cmd::SetSound(sf_sound(0, 0)));
+    play(&mut e, 60, 24_000, 24_000, &mut out);
+    assert!(peak(&out) > 0.05, "piano is silent: {}", peak(&out));
+    assert_clean(&out, "piano");
+    out.clear();
+    e.handle(Cmd::SetSound(sf_sound(128, 0)));
+    play(&mut e, 38, 2_400, 24_000, &mut out); // snare
+    assert!(peak(&out) > 0.05, "drum kit is silent");
+    assert_clean(&out, "drums");
+
+    // A captured layer keeps its SoundFont sound and replays it.
+    out.clear();
+    e.handle(Cmd::SetSound(sf_sound(0, 24))); // nylon guitar
+    render(&mut e, 4 * 48_000, &mut out); // a new phrase starts after 3 s
+
+    play(&mut e, 64, 12_000, 84_000, &mut out);
+    e.handle(Cmd::Capture);
+    let events = drain(&mut e);
+    assert!(events.iter().any(
+        |ev| matches!(ev, EngineEvent::LayerCaptured { sound, .. } if *sound == sf_sound(0, 24))
+    ));
+    out.clear();
+    render(&mut e, 48_000, &mut out);
+    assert!(peak(&out) > 0.02, "looped guitar is silent");
+    assert_clean(&out, "looped guitar");
 }

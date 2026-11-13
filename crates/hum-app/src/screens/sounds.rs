@@ -1,9 +1,8 @@
 //! Sounds screen (spec section 3.3).
 
+use crate::catalog::Group;
 use eframe::egui::{self, pos2, vec2, Align2, Id, Rect};
 use hum_engine::engine::Cmd;
-use hum_engine::presets::PRESETS;
-use hum_engine::Category;
 
 use crate::app::{HumApp, Tab};
 use crate::icons;
@@ -17,10 +16,11 @@ impl HumApp {
     /// Indices of the sounds matching the search text and category chip.
     pub(crate) fn filtered_sounds(&self) -> Vec<usize> {
         let needle = self.search.trim().to_lowercase();
-        PRESETS
+        self.catalog
+            .items
             .iter()
             .enumerate()
-            .filter(|(_, p)| self.category.is_none_or(|c| p.category == c))
+            .filter(|(_, p)| self.category.is_none_or(|c| p.group == c))
             .filter(|(_, p)| needle.is_empty() || p.name.to_lowercase().contains(&needle))
             .map(|(i, _)| i)
             .collect()
@@ -43,7 +43,7 @@ impl HumApp {
         let (count, color) = match self.assign_layer {
             Some(slot) => (format!("For Layer {}", slot + 1), theme::AMBER),
             None => (
-                format!("{} of {}", shown.len(), PRESETS.len()),
+                format!("{} of {}", shown.len(), self.catalog.items.len()),
                 theme::MUTED,
             ),
         };
@@ -83,7 +83,8 @@ impl HumApp {
         );
         let edit = egui::TextEdit::singleline(&mut self.search)
             .hint_text(
-                egui::RichText::new(format!("Search {} sounds", PRESETS.len())).color(theme::MUTED),
+                egui::RichText::new(format!("Search {} sounds", self.catalog.items.len()))
+                    .color(theme::MUTED),
             )
             .font(egui::FontId::proportional(15.0))
             .text_color(theme::TEXT)
@@ -124,8 +125,8 @@ impl HumApp {
         self.touches.claim(id, rect);
         let style_on = inter(14.0, 600);
         let style_off = inter(14.0, 500);
-        let labels: Vec<(Option<Category>, &str)> = std::iter::once((None, "All"))
-            .chain(Category::ALL.iter().map(|c| (Some(*c), c.name())))
+        let labels: Vec<(Option<Group>, &str)> = std::iter::once((None, "All"))
+            .chain(Group::ALL.iter().map(|c| (Some(*c), c.name())))
             .collect();
         let widths: Vec<f32> = labels
             .iter()
@@ -235,7 +236,8 @@ impl HumApp {
         let w = (rect.width() - CARD_GAP) / 2.0;
         let current = self
             .assigned_sound()
-            .unwrap_or_else(|| self.st.sound_index());
+            .or_else(|| self.catalog.index_of(&self.st.sound))
+            .unwrap_or(usize::MAX);
         let mut picked = None;
         for (n, &index) in shown.iter().enumerate() {
             let r = Rect::from_min_size(
@@ -248,14 +250,14 @@ impl HumApp {
             if r.bottom() < rect.top() || r.top() > rect.bottom() {
                 continue;
             }
-            let preset = &PRESETS[index];
+            let preset = self.catalog.items[index].clone();
             let selected = index == current;
             if selected {
                 widgets::surface_w(&clip, r, 20.0, theme::SURFACE_3, theme::AMBER, 2.0);
             } else {
                 widgets::surface(&clip, r, 20.0, theme::SURFACE, theme::LINE);
             }
-            let name = theme::fit(&clip, preset.name, grotesk(16.0, 600), r.width() - 28.0);
+            let name = theme::fit(&clip, &preset.name, grotesk(16.0, 600), r.width() - 28.0);
             theme::text(
                 &clip,
                 r.left_top() + vec2(14.0, 12.0),
@@ -271,7 +273,7 @@ impl HumApp {
             icons::wave(
                 &clip,
                 glyph,
-                preset.main_wave(),
+                preset.wave,
                 if selected {
                     theme::AMBER
                 } else {
@@ -281,7 +283,7 @@ impl HumApp {
             let (caption, style, color) = if selected {
                 ("Selected", inter(12.0, 600), theme::AMBER)
             } else {
-                (preset.category.name(), inter(12.0, 400), theme::MUTED)
+                (preset.group.name(), inter(12.0, 400), theme::MUTED)
             };
             theme::text(
                 &clip,
@@ -324,8 +326,8 @@ impl HumApp {
         widgets::surface(p, rect, 24.0, theme::SURFACE, theme::LINE);
         let assigning = self.assign_layer.is_some();
         let preset = match self.assigned_sound() {
-            Some(index) => &PRESETS[index],
-            None => self.preset(),
+            Some(index) => self.catalog.items[index].clone(),
+            None => self.instrument(),
         };
         let play_c = pos2(rect.left() + 10.0 + 24.0, rect.center().y);
         let play = Rect::from_center_size(play_c, vec2(48.0, 48.0));
@@ -373,7 +375,7 @@ impl HumApp {
 
         let x = play.right() + 12.0;
         let w = use_rect.left() - 10.0 - x;
-        let name = theme::fit(p, preset.name, grotesk(16.0, 600), w);
+        let name = theme::fit(p, &preset.name, grotesk(16.0, 600), w);
         theme::text(
             p,
             pos2(x, rect.center().y - 1.0),
@@ -386,7 +388,7 @@ impl HumApp {
             p,
             pos2(x, rect.center().y + 3.0),
             Align2::LEFT_TOP,
-            preset.category.name(),
+            preset.group.name(),
             inter(12.0, 400),
             theme::MUTED,
         );
@@ -395,6 +397,6 @@ impl HumApp {
     /// The sound of the loop layer being edited, if any.
     fn assigned_sound(&self) -> Option<usize> {
         let layer = self.layer(self.assign_layer?)?;
-        hum_engine::presets::find(&layer.sound)
+        self.catalog.index_of(&layer.sound)
     }
 }

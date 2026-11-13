@@ -3,7 +3,6 @@
 use std::sync::atomic::Ordering;
 
 use eframe::egui::{self, pos2, vec2, Align2, Id, Rect, Stroke};
-use hum_engine::presets::PRESETS;
 
 use crate::app::HumApp;
 use crate::audio::BufferMode;
@@ -262,7 +261,7 @@ impl HumApp {
         let mut cy = card.top();
         for (label, value) in [
             ("Version", crate::VERSION.to_owned()),
-            ("Sounds", PRESETS.len().to_string()),
+            ("Sounds", self.catalog.items.len().to_string()),
         ] {
             theme::text(
                 &clip,

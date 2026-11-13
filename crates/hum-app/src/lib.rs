@@ -2,6 +2,7 @@
 
 mod app;
 mod audio;
+mod catalog;
 #[cfg(not(target_os = "android"))]
 mod devshots;
 mod icons;

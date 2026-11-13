@@ -153,7 +153,7 @@ impl Saved {
     /// or come from an older version).
     pub fn sanitized(mut self) -> Self {
         let d = Saved::default();
-        if presets::find(&self.sound).is_none() {
+        if !crate::catalog::is_valid_key(&self.sound) {
             self.sound = d.sound.clone();
         }
         if !Scale::ALL.iter().any(|s| s.name() == self.scale) {
@@ -170,7 +170,7 @@ impl Saved {
         if let Some(looper) = &mut self.looper {
             looper.layers.resize(LAYERS, None);
             for layer in looper.layers.iter_mut().flatten() {
-                if presets::find(&layer.sound).is_none() {
+                if !crate::catalog::is_valid_key(&layer.sound) {
                     layer.sound = d.sound.clone();
                 }
                 layer.volume = unit(layer.volume, 1.0);
@@ -189,10 +189,6 @@ impl Saved {
             d.bpm
         };
         self
-    }
-
-    pub fn sound_index(&self) -> usize {
-        presets::find(&self.sound).unwrap_or(presets::DEFAULT_PRESET)
     }
 
     pub fn scale(&self) -> Scale {

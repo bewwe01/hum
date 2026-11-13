@@ -4,7 +4,6 @@
 
 use eframe::egui::{pos2, vec2, Align2, Painter, Rect};
 use hum_engine::engine::{Cmd, LAYERS};
-use hum_engine::presets::{self, PRESETS};
 
 use crate::app::HumApp;
 use crate::state::{LoopLayer, Looper};
@@ -23,10 +22,10 @@ impl HumApp {
             return;
         };
         let steps = f32::from(looper.steps);
-        let preset = presets::find(&layer.sound).unwrap_or(presets::DEFAULT_PRESET) as u8;
+        let sound = self.catalog.get(&layer.sound).sound;
         self.send(Cmd::BeginLayer {
             layer: slot as u8,
-            preset,
+            sound,
             muted: layer.muted,
             volume: layer.volume,
         });
@@ -156,13 +155,16 @@ impl HumApp {
         }
     }
 
+    /// Give layer `slot` catalog entry `index` as its sound.
     pub(crate) fn set_layer_sound(&mut self, slot: usize, index: usize) {
-        let index = index.min(PRESETS.len() - 1);
+        let Some(inst) = self.catalog.items.get(index).cloned() else {
+            return;
+        };
         if let Some(layer) = self.layer_mut(slot) {
-            layer.sound = PRESETS[index].name.to_owned();
-            self.send(Cmd::LayerPreset {
+            layer.sound = inst.key;
+            self.send(Cmd::LayerSound {
                 layer: slot as u8,
-                preset: index as u8,
+                sound: inst.sound,
             });
         }
     }
