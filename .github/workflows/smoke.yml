@@ -83,46 +83,50 @@ jobs:
           (cd android && ./gradlew --no-daemon assembleDebug -PhumKeepSymbols=true)
 
       - name: Run Hum on the emulator
+        timeout-minutes: 15
         run: |
-          set -x
           adb="$ANDROID_HOME/platform-tools/adb"
+          # Every device command gets a time limit, so a hung app or adbd
+          # cannot stall the job; failures are logged and the run goes on.
+          a() { echo "+ adb $*" >&2; timeout 90 "$adb" "$@" || echo "  (adb $1 failed or timed out: $?)" >&2; }
           mkdir -p results
-          "$adb" wait-for-device
-          for i in $(seq 1 120); do
-            [ "$("$adb" shell getprop sys.boot_completed | tr -d '\r')" = "1" ] && break
+          timeout 300 "$adb" wait-for-device
+          for i in $(seq 1 150); do
+            [ "$(timeout 10 "$adb" shell getprop sys.boot_completed | tr -d '\r')" = "1" ] && break
             sleep 2
           done
-          "$adb" root || true
-          sleep 3
-          "$adb" wait-for-device
-          "$adb" shell settings put global window_animation_scale 0
-          "$adb" install -r android/app/build/outputs/apk/debug/app-debug.apk
-          "$adb" logcat -c
-          "$adb" shell am start -W -n com.example.hum/android.app.NativeActivity
+          echo "booted after ~$((i * 2)) s"
+          a root
+          sleep 5
+          timeout 60 "$adb" wait-for-device
+          a shell settings put global window_animation_scale 0
+          a install -r android/app/build/outputs/apk/debug/app-debug.apk
+          a logcat -c
+          a shell am start -n com.example.hum/android.app.NativeActivity
           sleep 20
-          "$adb" exec-out screencap -p > results/1-after-launch.png
+          timeout 30 "$adb" exec-out screencap -p > results/1-after-launch.png
           # Tap a key on the keyboard area (lower middle of a 1080x2400 screen).
-          "$adb" shell input tap 540 1900
+          a shell input tap 540 1900
           sleep 2
-          "$adb" exec-out screencap -p > results/2-after-tap.png
-          "$adb" shell input tap 540 2280
+          timeout 30 "$adb" exec-out screencap -p > results/2-after-tap.png
+          a shell input tap 540 2280
           sleep 8
-          "$adb" exec-out screencap -p > results/3-later.png
-          pid="$("$adb" shell pidof com.example.hum | tr -d '\r')"
+          timeout 30 "$adb" exec-out screencap -p > results/3-later.png
+          pid="$(timeout 10 "$adb" shell pidof com.example.hum | tr -d '\r')"
           echo "pid=$pid"
           if [ -n "$pid" ]; then
-            "$adb" shell debuggerd -b "$pid" > results/stacks-native.txt 2>&1 || true
-            "$adb" shell kill -3 "$pid" || true
-            sleep 3
+            timeout 60 "$adb" shell debuggerd -b "$pid" > results/stacks-native.txt 2>&1 || echo "debuggerd failed: $?"
+            a shell kill -3 "$pid"
+            sleep 5
           fi
-          "$adb" shell 'ls -t /data/anr/ | head -n 3' > results/anr-files.txt 2>&1 || true
-          for f in $("$adb" shell 'ls -t /data/anr/ | head -n 2' | tr -d '\r'); do
-            "$adb" pull "/data/anr/$f" "results/$f" || true
+          timeout 20 "$adb" shell 'ls -t /data/anr/' > results/anr-files.txt 2>&1 || true
+          for f in $(head -n 3 results/anr-files.txt | tr -d '\r'); do
+            a pull "/data/anr/$f" "results/$f"
           done
-          "$adb" logcat -d -v threadtime > results/logcat.txt
-          "$adb" shell dumpsys activity activities | grep -E "mResumedActivity|mFocusedApp" > results/activity.txt || true
-          grep -E " hum |hum_app|ANR in|FATAL|panicked" results/logcat.txt | head -n 80 || true
-          cp emulator.log results/ || true
+          timeout 60 "$adb" logcat -d -v threadtime > results/logcat.txt || true
+          timeout 20 "$adb" shell dumpsys activity activities > results/activities.txt 2>&1 || true
+          echo "== app log lines"
+          grep -E " hum |hum_app|ANR in|FATAL|panicked|watchdog" results/logcat.txt | head -n 80 || true
 
       - name: Upload results
         if: always()
