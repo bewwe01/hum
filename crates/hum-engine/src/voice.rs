@@ -30,6 +30,8 @@ pub struct Macros {
     pub reverb: f32,
     /// Part volume (loop layers), 1 = unchanged.
     pub gain: f32,
+    /// Part pan, -1 (left) .. 1 (right).
+    pub pan: f32,
 }
 
 impl Macros {
@@ -40,6 +42,7 @@ impl Macros {
         release: 1.0,
         reverb: -1.0,
         gain: 1.0,
+        pan: 0.0,
     };
 }
 
@@ -497,6 +500,16 @@ impl Voice {
         let click_coef = (-inv_sr / 0.0008).exp();
 
         let reverb_send = if m.reverb >= 0.0 { m.reverb } else { p.reverb }.clamp(0.0, 1.0);
+        // Equal-power part pan, unity gain in the centre.
+        let pan_angle = (m.pan.clamp(-1.0, 1.0) + 1.0) * 0.25 * core::f32::consts::PI;
+        let (pan_l, pan_r) = if m.pan == 0.0 {
+            (1.0, 1.0)
+        } else {
+            (
+                pan_angle.cos() * core::f32::consts::SQRT_2,
+                pan_angle.sin() * core::f32::consts::SQRT_2,
+            )
+        };
         let unison = self.unison;
         let w0 = p.osc[0].wave;
         let w1 = p.osc[1].wave;
@@ -633,8 +646,8 @@ impl Voice {
                 }
                 a *= self.fade;
             }
-            let yl = out[0] * a;
-            let yr = out[1] * a;
+            let yl = out[0] * a * pan_l;
+            let yr = out[1] * a * pan_r;
 
             let j = offset + i;
             buses.dry[j][0] += yl;

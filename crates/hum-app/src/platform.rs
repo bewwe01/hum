@@ -44,6 +44,19 @@ impl Platform {
 
     pub fn haptic_tick(&self) {}
 
+    /// Save an exported file to ~/Downloads/Hum. Returns where it went.
+    pub fn save_download(&self, name: &str, bytes: &[u8]) -> Result<String, String> {
+        let base = std::env::var_os("HOME")
+            .map(|h| PathBuf::from(h).join("Downloads"))
+            .or_else(|| self.data_dir())
+            .ok_or("no Downloads folder")?;
+        let dir = base.join("Hum");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+        Ok(path.display().to_string())
+    }
+
     /// Parse the bundled SoundFont (from the repository's assets folder).
     pub fn load_soundfont(&self) -> crate::audio::LoadedSoundFont {
         let path = concat!(
@@ -82,6 +95,14 @@ impl Platform {
     /// The app's private files directory (no permission needed).
     pub fn data_dir(&self) -> Option<PathBuf> {
         self.app.internal_data_path()
+    }
+
+    /// Save an exported file to Downloads/Hum through MediaStore (Android 10
+    /// and later, no permission needed), or to the app's own external files
+    /// folder on older versions. Returns where it went.
+    pub fn save_download(&self, name: &str, bytes: &[u8]) -> Result<String, String> {
+        let sdk = winit::platform::android::activity::AndroidApp::sdk_version();
+        jni_glue::save_download(sdk, name, bytes)
     }
 
     /// Parse the SoundFont packaged in the APK's assets.
@@ -368,6 +389,107 @@ mod jni_glue {
             )?;
             Ok(())
         });
+    }
+
+    /// See `Platform::save_download`.
+    pub fn save_download(sdk: i32, name: &str, bytes: &[u8]) -> Result<String, String> {
+        if sdk >= 29 {
+            let saved = with_activity(|env, activity| {
+                let resolver = env
+                    .call_method(
+                        activity,
+                        jni_str!("getContentResolver"),
+                        jni_sig!("()Landroid/content/ContentResolver;"),
+                        &[],
+                    )?
+                    .l()?;
+                let values_class = env.find_class(jni_str!("android/content/ContentValues"))?;
+                let values = env.new_object(&values_class, jni_sig!("()V"), &[])?;
+                for (key, value) in [
+                    ("_display_name", name),
+                    ("mime_type", "audio/wav"),
+                    ("relative_path", "Download/Hum/"),
+                ] {
+                    let key = env.new_string(key)?;
+                    let value = env.new_string(value)?;
+                    env.call_method(
+                        &values,
+                        jni_str!("put"),
+                        jni_sig!("(Ljava/lang/String;Ljava/lang/String;)V"),
+                        &[JValue::Object(&key), JValue::Object(&value)],
+                    )?;
+                }
+                let downloads =
+                    env.find_class(jni_str!("android/provider/MediaStore$Downloads"))?;
+                let collection = env
+                    .get_static_field(
+                        &downloads,
+                        jni_str!("EXTERNAL_CONTENT_URI"),
+                        jni_sig!("Landroid/net/Uri;"),
+                    )?
+                    .l()?;
+                let item = env
+                    .call_method(
+                        &resolver,
+                        jni_str!("insert"),
+                        jni_sig!(
+                            "(Landroid/net/Uri;Landroid/content/ContentValues;)Landroid/net/Uri;"
+                        ),
+                        &[JValue::Object(&collection), JValue::Object(&values)],
+                    )?
+                    .l()?;
+                if item.is_null() {
+                    return Ok(false);
+                }
+                let stream = env
+                    .call_method(
+                        &resolver,
+                        jni_str!("openOutputStream"),
+                        jni_sig!("(Landroid/net/Uri;)Ljava/io/OutputStream;"),
+                        &[JValue::Object(&item)],
+                    )?
+                    .l()?;
+                let array = env.byte_array_from_slice(bytes)?;
+                env.call_method(
+                    &stream,
+                    jni_str!("write"),
+                    jni_sig!("([B)V"),
+                    &[JValue::Object(&array)],
+                )?;
+                env.call_method(&stream, jni_str!("close"), jni_sig!("()V"), &[])?;
+                Ok(true)
+            });
+            return match saved {
+                Some(true) => Ok(format!("Downloads/Hum/{name}")),
+                _ => Err("could not save to Downloads".to_owned()),
+            };
+        }
+        // Android 8 and 9: the app's own folder (Android/data/<app>/files).
+        let dir = with_activity(|env, activity| {
+            let none = JObject::null();
+            let file = env
+                .call_method(
+                    activity,
+                    jni_str!("getExternalFilesDir"),
+                    jni_sig!("(Ljava/lang/String;)Ljava/io/File;"),
+                    &[JValue::Object(&none)],
+                )?
+                .l()?;
+            let path = env
+                .call_method(
+                    &file,
+                    jni_str!("getAbsolutePath"),
+                    jni_sig!("()Ljava/lang/String;"),
+                    &[],
+                )?
+                .l()?;
+            let path = unsafe { jni::objects::JString::from_raw(env, path.into_raw()) };
+            Ok(path.to_string())
+        })
+        .ok_or("no files folder")?;
+        let path = std::path::Path::new(&dir).join(name);
+        std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+        Ok(path.display().to_string())
     }
 
     pub fn move_task_to_back() {

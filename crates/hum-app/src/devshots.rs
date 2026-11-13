@@ -122,6 +122,9 @@ fn arrange(app: &mut HumApp, step: usize) {
             }
             app.send(Cmd::LoopPlay(true));
             app.tab = Tab::Loop;
+            if std::env::var_os("HUM_SHOTS_EXPORT").is_some() {
+                app.export_loop();
+            }
         }
         5 => {
             app.st.play_mode = crate::keyboard::PlayMode::Chords;
@@ -138,7 +141,8 @@ fn arrange(app: &mut HumApp, step: usize) {
         }
         8 => {
             app.st.play_mode = crate::keyboard::PlayMode::Drums;
-            app.tab = Tab::Play;
+            app.tab = Tab::Loop;
+            app.sheet = Some(Sheet::Layer(1));
         }
         _ => {
             app.tab = Tab::Play;

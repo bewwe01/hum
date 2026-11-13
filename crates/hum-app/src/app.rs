@@ -67,6 +67,8 @@ pub enum Sheet {
     Key,
     Scale,
     ConfirmClearAll,
+    /// Mix settings for one loop layer.
+    Layer(usize),
 }
 
 pub struct HumApp {
@@ -113,6 +115,9 @@ pub struct HumApp {
     pub(crate) assign_layer: Option<usize>,
     /// A short message shown above the tab bar until the given time.
     pub(crate) toast: Option<(String, f64)>,
+    /// A loop export in progress (its result arrives here).
+    pub(crate) exporting: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    pub(crate) repaint: egui::Context,
 
     // Beats screen.
     pub(crate) drum: usize,
@@ -176,6 +181,8 @@ impl HumApp {
             redo: Vec::new(),
             assign_layer: None,
             toast: None,
+            exporting: None,
+            repaint: cc.egui_ctx.clone(),
             drum: 0,
             rng: 0x2545_F491,
             bpm_repeat_at: 0.0,
@@ -366,6 +373,7 @@ impl HumApp {
                 if slot < looper.layers.len() {
                     looper.layers[slot] = Some(LoopLayer {
                         sound: catalog::key_for_sound(sound),
+                        reverb: self.st.reverb,
                         ..LoopLayer::default()
                     });
                     looper.order.retain(|&l| l != layer);
@@ -453,6 +461,7 @@ impl HumApp {
         self.touches.begin_frame(&ctx);
         watchdog.enter(Stage::Audio);
         self.pump_audio(&ctx);
+        self.poll_export();
         watchdog.enter(Stage::Insets);
         self.poll_insets(&ctx);
         watchdog.enter(Stage::Draw);
@@ -696,6 +705,7 @@ impl HumApp {
             Sheet::Key => 20.0 + 28.0 + 14.0 + 3.0 * 48.0 + 2.0 * 8.0 + 20.0,
             Sheet::Scale => 20.0 + 28.0 + 14.0 + 7.0 * 48.0 + 6.0 * 6.0 + 20.0,
             Sheet::ConfirmClearAll => 20.0 + 28.0 + 8.0 + 40.0 + 16.0 + 48.0 + 20.0,
+            Sheet::Layer(_) => 20.0 + 28.0 + 14.0 + 3.0 * 56.0 + 12.0 + 48.0 + 10.0 + 48.0 + 20.0,
         };
         let rect = Rect::from_min_size(
             pos2(
@@ -710,6 +720,14 @@ impl HumApp {
             Sheet::Key => "Key",
             Sheet::Scale => "Scale",
             Sheet::ConfirmClearAll => "Clear all layers?",
+            Sheet::Layer(_) => "",
+        };
+        let layer_title;
+        let title = if let Sheet::Layer(slot) = sheet {
+            layer_title = format!("Layer {}", slot + 1);
+            layer_title.as_str()
+        } else {
+            title
         };
         theme::text(
             p,
@@ -723,6 +741,11 @@ impl HumApp {
         let mut close = false;
 
         match sheet {
+            Sheet::Layer(slot) => {
+                if self.layer_sheet(p, inner, top, slot) {
+                    close = true;
+                }
+            }
             Sheet::Key => {
                 let gap = 8.0;
                 let w = (inner.width() - gap * 3.0) / 4.0;

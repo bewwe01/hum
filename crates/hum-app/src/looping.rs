@@ -11,23 +11,32 @@ use crate::theme::{self, inter};
 use crate::widgets;
 
 impl HumApp {
-    /// Send layer `slot` (its notes, sound, mute and volume) to the engine,
-    /// or clear it there if the slot is empty.
-    pub(crate) fn send_layer(&self, slot: usize) {
+    /// The engine commands that load layer `slot` (or clear it if empty).
+    pub(crate) fn layer_cmds(&self, slot: usize) -> Vec<Cmd> {
+        let mut cmds = Vec::new();
         let Some(looper) = &self.st.looper else {
-            return;
+            return cmds;
         };
         let Some(Some(layer)) = looper.layers.get(slot) else {
-            self.send(Cmd::ClearLayer(slot as u8));
-            return;
+            cmds.push(Cmd::ClearLayer(slot as u8));
+            return cmds;
         };
         let steps = f32::from(looper.steps);
+        let layer_id = slot as u8;
         let sound = self.catalog.get(&layer.sound).sound;
-        self.send(Cmd::BeginLayer {
-            layer: slot as u8,
+        cmds.push(Cmd::BeginLayer {
+            layer: layer_id,
             sound,
             muted: layer.muted,
             volume: layer.volume,
+        });
+        cmds.push(Cmd::LayerPan {
+            layer: layer_id,
+            pan: layer.pan,
+        });
+        cmds.push(Cmd::LayerReverb {
+            layer: layer_id,
+            reverb: layer.reverb,
         });
         for n in &layer.notes {
             let (mut on, mut off) = (n.on, n.off);
@@ -37,15 +46,23 @@ impl HumApp {
                 on = on.round().rem_euclid(steps);
                 off = (on + length).rem_euclid(steps);
             }
-            self.send(Cmd::LoadNote {
-                layer: slot as u8,
+            cmds.push(Cmd::LoadNote {
+                layer: layer_id,
                 note: n.note,
                 velocity: n.velocity,
                 on,
                 off,
             });
         }
-        self.send(Cmd::EndLayer(slot as u8));
+        cmds.push(Cmd::EndLayer(layer_id));
+        cmds
+    }
+
+    /// Send layer `slot` to the engine.
+    pub(crate) fn send_layer(&self, slot: usize) {
+        for cmd in self.layer_cmds(slot) {
+            self.send(cmd);
+        }
     }
 
     /// Turn what was just played into a layer (the engine replies with
@@ -169,6 +186,28 @@ impl HumApp {
         }
     }
 
+    pub(crate) fn set_layer_pan(&mut self, slot: usize, pan: f32) {
+        if let Some(layer) = self.layer_mut(slot) {
+            layer.pan = pan.clamp(-1.0, 1.0);
+            let pan = layer.pan;
+            self.send(Cmd::LayerPan {
+                layer: slot as u8,
+                pan,
+            });
+        }
+    }
+
+    pub(crate) fn set_layer_reverb(&mut self, slot: usize, reverb: f32) {
+        if let Some(layer) = self.layer_mut(slot) {
+            layer.reverb = reverb.clamp(0.0, 1.0);
+            let reverb = layer.reverb;
+            self.send(Cmd::LayerReverb {
+                layer: slot as u8,
+                reverb,
+            });
+        }
+    }
+
     pub(crate) fn toggle_tidy(&mut self, slot: usize) {
         if let Some(layer) = self.layer_mut(slot) {
             layer.tidy = !layer.tidy;
@@ -181,7 +220,7 @@ impl HumApp {
         let w =
             (theme::galley(p, text, style, theme::TEXT).size().x + 40.0).min(safe.width() - 32.0);
         let rect = Rect::from_center_size(
-            pos2(safe.center().x, safe.bottom() - 16.0 - 64.0 - 14.0 - 24.0),
+            pos2(safe.center().x, safe.top() + 20.0 + 22.0),
             vec2(w, 44.0),
         );
         widgets::surface(p, rect, 22.0, theme::SURFACE_3, theme::VIOLET);

@@ -235,6 +235,50 @@ impl Reverb {
 }
 
 // ---------------------------------------------------------------------------
+// Bus compressor
+
+/// A gentle stereo-linked RMS compressor in front of the limiter: as loop
+/// layers stack up it evens out the level ("glue") so the limiter rarely
+/// has to work hard.
+pub struct Compressor {
+    env: f32,
+    attack: f32,
+    release: f32,
+}
+
+impl Compressor {
+    /// Threshold (linear, about -12 dBFS) and ratio.
+    const THRESHOLD: f32 = 0.25;
+    const RATIO: f32 = 2.0;
+
+    pub fn new(sample_rate: f32) -> Self {
+        Self {
+            env: 0.0,
+            attack: 1.0 - (-1.0 / (0.010 * sample_rate)).exp(),
+            release: 1.0 - (-1.0 / (0.250 * sample_rate)).exp(),
+        }
+    }
+
+    #[inline]
+    pub fn process(&mut self, input: [f32; 2]) -> [f32; 2] {
+        let power = 0.5 * (input[0] * input[0] + input[1] * input[1]);
+        let power = if power.is_finite() { power } else { 0.0 };
+        let coef = if power > self.env {
+            self.attack
+        } else {
+            self.release
+        };
+        self.env = flush(self.env + (power - self.env) * coef);
+        let level = self.env.sqrt();
+        if level <= Self::THRESHOLD {
+            return input;
+        }
+        let gain = (Self::THRESHOLD / level).powf(1.0 - 1.0 / Self::RATIO);
+        [input[0] * gain, input[1] * gain]
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Master soft limiter
 
 /// Level where the limiter starts to act.

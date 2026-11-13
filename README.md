@@ -1,8 +1,21 @@
 # Hum
 
-A synth playground for complete beginners. Open it, pick a sound, play.
-Notes are locked to a scale, so nothing sounds wrong. Hum has 56 built-in
-sounds, a four-layer looper and a 16-step beat maker.
+A synth and instrument playground for complete beginners. Open it, pick a
+sound, play. Notes can be locked to a scale, so nothing sounds wrong.
+
+- **197 sounds:** pianos, keys, guitars, basses, strings, brass and wind,
+  choirs, world instruments and 13 drum kits from the bundled GeneralUser
+  GS SoundFont, plus Hum's own 56 synth sounds.
+- **Capture looping:** play first, then tap **Loop** and what you just
+  played repeats. The first loop sets the length and the tempo. Each
+  later tap adds what you played over the loop as a new layer, up to 8.
+  Every layer has its own on/off switch, volume, pan, reverb, "tidy
+  timing", and a sound you can change after recording. There is undo
+  and redo, the loop is saved, and you can export it as a WAV file to
+  Downloads/Hum.
+- **Four ways to play:** scale-locked keys, piano keys, chord pads and
+  drum pads. Where you touch a key sets how loud it plays.
+- A 16-step beat maker on the same clock.
 
 Hum is a personal Android app for a Pixel (arm64) running GrapheneOS. It
 **requests zero permissions**, has no network code and no analytics, and
@@ -208,6 +221,10 @@ being touched.
   its minimum of 140.
 
 ## Licence of bundled assets
+
+GeneralUser GS v2.0.3 by S. Christian Collins
+(`assets/soundfonts/GeneralUser-GS-LICENSE.txt`): free to use in music and
+in software projects.
 
 Space Grotesk: SIL Open Font License 1.1 (`assets/fonts/SpaceGrotesk-OFL.txt`).
 Inter: SIL Open Font License 1.1 (`assets/fonts/Inter-LICENSE.txt`).

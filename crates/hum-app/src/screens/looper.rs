@@ -70,7 +70,30 @@ impl HumApp {
             self.st.metronome = !self.st.metronome;
             self.send(Cmd::Metronome(self.st.metronome));
         }
-        self.bpm_pill(&p, rect.right() - 44.0 - 8.0, y + 22.0);
+        let pill = self.bpm_pill(&p, rect.right() - 44.0 - 8.0, y + 22.0);
+        let export_c = pos2(pill.left() - 8.0 - 22.0, y + 22.0);
+        let has_loop = self.st.looper.is_some();
+        let tap = self.touches.button(
+            Id::unique("loop-export"),
+            Rect::from_center_size(export_c, vec2(44.0, 44.0)),
+        );
+        widgets::circle(
+            &p,
+            export_c,
+            22.0,
+            widgets::pressed(theme::SURFACE, tap.down && has_loop),
+            theme::LINE,
+        );
+        let busy = self.exporting.is_some();
+        let color = if has_loop && !busy {
+            theme::TEXT
+        } else {
+            theme::alpha(theme::MUTED, 0.45)
+        };
+        icons::download(&p, export_c, 24.0, color);
+        if tap.clicked && has_loop {
+            self.export_loop();
+        }
         y += 44.0 + GAP;
 
         // ---- layout ----------------------------------------------------------
@@ -293,7 +316,7 @@ impl HumApp {
             self.toggle_layer(slot);
         }
 
-        // Buttons on the right: tidy timing, delete.
+        // Buttons on the right: mix settings, delete.
         let trash = Rect::from_min_size(
             pos2(row.right() - 4.0 - 40.0, row.top() + 6.0),
             vec2(40.0, 44.0),
@@ -302,15 +325,15 @@ impl HumApp {
             Rect::from_min_size(pos2(trash.left() - 40.0, row.top() + 6.0), vec2(40.0, 44.0));
         let tap = self
             .touches
-            .button(Id::unique(("layer-tidy", slot)), hit(tidy));
-        if layer.tidy {
+            .button(Id::unique(("layer-mix", slot)), hit(tidy));
+        if tap.down {
             p.rect_filled(
                 Rect::from_center_size(tidy.center(), vec2(34.0, 30.0)),
                 10.0,
-                theme::SURFACE_3,
+                theme::SURFACE_2,
             );
         }
-        icons::grid(
+        icons::sliders(
             p,
             tidy.center(),
             20.0,
@@ -321,12 +344,7 @@ impl HumApp {
             },
         );
         if tap.clicked {
-            self.toggle_tidy(slot);
-            self.show_toast(if layer.tidy {
-                "Tidy timing off"
-            } else {
-                "Tidy timing on: notes snap to the beat"
-            });
+            self.sheet = Some(Sheet::Layer(slot));
         }
         let tap = self
             .touches
@@ -527,6 +545,194 @@ impl HumApp {
         if tap.clicked && has_layers {
             self.sheet = Some(Sheet::ConfirmClearAll);
         }
+    }
+
+    /// The layer sheet: sound, volume, pan, reverb, tidy timing, delete.
+    /// Returns true when the sheet should close.
+    pub(crate) fn layer_sheet(&mut self, p: &Painter, inner: Rect, top: f32, slot: usize) -> bool {
+        let Some(layer) = self.layer(slot).cloned() else {
+            return true;
+        };
+        let color = layer_color(slot);
+        let mut close = false;
+        let mut y = top;
+        for i in 0..3usize {
+            let label = ["Volume", "Pan", "Reverb"][i];
+            let r = Rect::from_min_size(pos2(inner.left(), y), vec2(inner.width(), 56.0));
+            let track =
+                Rect::from_min_max(pos2(r.left(), r.top() + 22.0), pos2(r.right(), r.bottom()));
+            let id = Id::unique(("layer-sheet-slider", slot, i));
+            self.touches.claim(id, track);
+            let drag = self
+                .touches
+                .owned(id)
+                .filter(|t| !t.ended)
+                .last()
+                .map(|t| t.pos.x);
+            if let Some(x) = drag {
+                let v = ((x - track.left() - 10.0) / (track.width() - 20.0)).clamp(0.0, 1.0);
+                match i {
+                    0 => self.set_layer_volume(slot, v),
+                    1 => {
+                        // Snap to the centre.
+                        let pan = v * 2.0 - 1.0;
+                        self.set_layer_pan(slot, if pan.abs() < 0.06 { 0.0 } else { pan });
+                    }
+                    _ => self.set_layer_reverb(slot, v),
+                }
+            }
+            let now = self.layer(slot).cloned().unwrap_or_else(|| layer.clone());
+            let value = match i {
+                0 => now.volume,
+                1 => (now.pan + 1.0) / 2.0,
+                _ => now.reverb,
+            };
+            let shown = match i {
+                1 if now.pan.abs() < 0.05 => "Centre".to_owned(),
+                1 if now.pan < 0.0 => format!("Left {}", (-now.pan * 100.0).round() as i32),
+                1 => format!("Right {}", (now.pan * 100.0).round() as i32),
+                _ => format!("{}%", (value * 100.0).round() as i32),
+            };
+            theme::text(
+                p,
+                pos2(r.left(), r.top() + 10.0),
+                Align2::LEFT_CENTER,
+                label,
+                inter(14.0, 600),
+                theme::TEXT,
+            );
+            theme::text(
+                p,
+                pos2(r.right(), r.top() + 10.0),
+                Align2::RIGHT_CENTER,
+                &shown,
+                inter(13.0, 400),
+                theme::MUTED,
+            );
+            let (x0, x1, cy) = (track.left() + 10.0, track.right() - 10.0, track.center().y);
+            p.line_segment([pos2(x0, cy), pos2(x1, cy)], Stroke::new(4.0, theme::LINE));
+            let xv = x0 + (x1 - x0) * value;
+            let from = if i == 1 { (x0 + x1) / 2.0 } else { x0 };
+            p.line_segment(
+                [pos2(from.min(xv), cy), pos2(from.max(xv), cy)],
+                Stroke::new(4.0, color),
+            );
+            p.circle_filled(pos2(xv, cy), 9.0, theme::TEXT);
+            y += 56.0;
+        }
+        y += 12.0;
+        let gap = 10.0;
+        let w = (inner.width() - gap) / 2.0;
+        let sound = Rect::from_min_size(pos2(inner.left(), y), vec2(w, 48.0));
+        let tidy = Rect::from_min_size(pos2(inner.left() + w + gap, y), vec2(w, 48.0));
+        let tap = self
+            .touches
+            .button(Id::unique(("layer-sheet-sound", slot)), sound);
+        widgets::surface(
+            p,
+            sound,
+            24.0,
+            widgets::pressed(theme::SURFACE_2, tap.down),
+            theme::LINE,
+        );
+        let name = theme::fit(
+            p,
+            &self.catalog.get(&layer.sound).name,
+            inter(14.0, 600),
+            w - 28.0,
+        );
+        theme::text(
+            p,
+            sound.center(),
+            Align2::CENTER_CENTER,
+            &name,
+            inter(14.0, 600),
+            theme::TEXT,
+        );
+        if tap.clicked {
+            self.assign_layer = Some(slot);
+            self.tab = Tab::Sounds;
+            close = true;
+        }
+        let tap = self
+            .touches
+            .button(Id::unique(("layer-sheet-tidy", slot)), tidy);
+        let tidy_on = self.layer(slot).is_some_and(|l| l.tidy);
+        if tidy_on {
+            widgets::surface(p, tidy, 24.0, theme::VIOLET, theme::VIOLET_LIGHT);
+        } else {
+            widgets::surface(
+                p,
+                tidy,
+                24.0,
+                widgets::pressed(theme::SURFACE_2, tap.down),
+                theme::LINE,
+            );
+        }
+        let tc = if tidy_on {
+            theme::ON_VIOLET
+        } else {
+            theme::TEXT
+        };
+        theme::text(
+            p,
+            tidy.center(),
+            Align2::CENTER_CENTER,
+            "Tidy timing",
+            inter(14.0, 600),
+            tc,
+        );
+        if tap.clicked {
+            self.toggle_tidy(slot);
+        }
+        y += 48.0 + 10.0;
+        let delete = Rect::from_min_size(pos2(inner.left(), y), vec2(w, 48.0));
+        let done = Rect::from_min_size(pos2(inner.left() + w + gap, y), vec2(w, 48.0));
+        let tap = self
+            .touches
+            .button(Id::unique(("layer-sheet-delete", slot)), delete);
+        widgets::surface(
+            p,
+            delete,
+            24.0,
+            widgets::pressed(theme::SURFACE, tap.down),
+            theme::LINE,
+        );
+        theme::text(
+            p,
+            delete.center(),
+            Align2::CENTER_CENTER,
+            "Delete layer",
+            inter(14.0, 600),
+            theme::TEXT,
+        );
+        if tap.clicked {
+            self.delete_layer(slot);
+            self.show_toast("Layer deleted (Redo brings it back)");
+            close = true;
+        }
+        let tap = self
+            .touches
+            .button(Id::unique(("layer-sheet-done", slot)), done);
+        widgets::surface(
+            p,
+            done,
+            24.0,
+            widgets::pressed(theme::AMBER, tap.down),
+            theme::AMBER_LIGHT,
+        );
+        theme::text(
+            p,
+            done.center(),
+            Align2::CENTER_CENTER,
+            "Done",
+            inter(14.0, 600),
+            theme::ON_AMBER,
+        );
+        if tap.clicked {
+            close = true;
+        }
+        close
     }
 
     /// The big amber Loop button (used on the Play and Loop screens).

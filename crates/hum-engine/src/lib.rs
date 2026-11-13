@@ -14,6 +14,7 @@ pub mod presets;
 pub mod scale;
 pub mod transport;
 pub mod voice;
+pub mod wav;
 
 pub use engine::{CaptureError, Cmd, Engine, EngineEvent, Shared, Status};
 pub use preset::{Category, Preset, Wave};

@@ -443,3 +443,35 @@ pub fn pause(p: &Painter, c: Pos2, size: f32, color: Color32) {
         );
     }
 }
+
+/// Arrow down into a tray (export / save).
+pub fn download(p: &Painter, c: Pos2, size: f32, color: Color32) {
+    let s = size * 0.3;
+    polyline(
+        p,
+        &[c + vec2(0.0, -s * 1.1), c + vec2(0.0, s * 0.45)],
+        W,
+        color,
+    );
+    polyline(
+        p,
+        &[
+            c + vec2(-s * 0.55, -s * 0.05),
+            c + vec2(0.0, s * 0.5),
+            c + vec2(s * 0.55, -s * 0.05),
+        ],
+        W,
+        color,
+    );
+    polyline(
+        p,
+        &[
+            c + vec2(-s, s * 0.5),
+            c + vec2(-s, s),
+            c + vec2(s, s),
+            c + vec2(s, s * 0.5),
+        ],
+        W,
+        color,
+    );
+}

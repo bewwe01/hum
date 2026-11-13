@@ -13,7 +13,7 @@ use std::sync::Arc;
 use rustysynth::Synthesizer;
 
 use crate::dsp::{smooth_coef, Rng, TAU};
-use crate::fx::{Chorus, Delay, Limiter, Reverb};
+use crate::fx::{Chorus, Compressor, Delay, Limiter, Reverb};
 use crate::preset::{ArpPattern, Preset};
 use crate::presets::{self, PRESETS};
 use crate::scale::KeyMap;
@@ -255,6 +255,16 @@ pub enum Cmd {
         layer: u8,
         volume: f32,
     },
+    /// Layer pan, -1 (left) .. 1 (right).
+    LayerPan {
+        layer: u8,
+        pan: f32,
+    },
+    /// Layer reverb send, 0..1.
+    LayerReverb {
+        layer: u8,
+        reverb: f32,
+    },
     LayerSound {
         layer: u8,
         sound: SoundId,
@@ -438,6 +448,7 @@ pub struct Engine {
     chorus: Chorus,
     delay: Delay,
     reverb: Reverb,
+    compressor: Compressor,
     limiter: Limiter,
     volume: f32,
     rng: Rng,
@@ -484,7 +495,7 @@ pub struct Engine {
     sf: Option<Box<Synthesizer>>,
     /// Sound and controller values last sent to each SoundFont channel.
     sf_sound: [SoundId; SF_CHANNELS],
-    sf_cc: [[i32; 3]; SF_CHANNELS],
+    sf_cc: [[i32; 4]; SF_CHANNELS],
     sf_left: [f32; MAX_BLOCK],
     sf_right: [f32; MAX_BLOCK],
 }
@@ -511,6 +522,7 @@ impl Engine {
             chorus: Chorus::new(sample_rate),
             delay: Delay::new(sample_rate),
             reverb: Reverb::new(sample_rate),
+            compressor: Compressor::new(sample_rate),
             limiter: Limiter::new(sample_rate),
             volume: 0.0,
             rng: Rng::new(0xC0FF_EE11),
@@ -567,7 +579,7 @@ impl Engine {
             events_len: 0,
             sf: None,
             sf_sound: [SoundId::MAX; SF_CHANNELS],
-            sf_cc: [[-1; 3]; SF_CHANNELS],
+            sf_cc: [[-1; 4]; SF_CHANNELS],
             sf_left: [0.0; MAX_BLOCK],
             sf_right: [0.0; MAX_BLOCK],
         };
@@ -594,7 +606,7 @@ impl Engine {
     /// Install the SoundFont player; returns the previous one, if any.
     pub fn set_synth(&mut self, synth: Box<Synthesizer>) -> Option<Box<Synthesizer>> {
         self.sf_sound = [SoundId::MAX; SF_CHANNELS];
-        self.sf_cc = [[-1; 3]; SF_CHANNELS];
+        self.sf_cc = [[-1; 4]; SF_CHANNELS];
         self.sf.replace(synth)
     }
 
@@ -701,6 +713,17 @@ impl Engine {
                 if let Some(l) = self.layers.get_mut(layer as usize) {
                     l.volume = volume.clamp(0.0, 1.5);
                     self.macros[PART_LAYER0 as usize + layer as usize].gain = l.volume;
+                }
+            }
+            Cmd::LayerPan { layer, pan } => {
+                if (layer as usize) < LAYERS {
+                    self.macros[PART_LAYER0 as usize + layer as usize].pan = pan.clamp(-1.0, 1.0);
+                }
+            }
+            Cmd::LayerReverb { layer, reverb } => {
+                if (layer as usize) < LAYERS {
+                    self.macros[PART_LAYER0 as usize + layer as usize].reverb =
+                        reverb.clamp(0.0, 1.0);
                 }
             }
             Cmd::LayerSound { layer, sound } => {
@@ -1151,8 +1174,9 @@ impl Engine {
                 (volume * 100.0).round().clamp(0.0, 127.0) as i32,
                 (reverb * 127.0).round().clamp(0.0, 127.0) as i32,
                 (wobble * 100.0).round().clamp(0.0, 127.0) as i32,
+                (64.0 + m.pan * 63.0).round().clamp(0.0, 127.0) as i32,
             ];
-            for (k, cc) in [0x07, 0x5B, 0x01].into_iter().enumerate() {
+            for (k, cc) in [0x07, 0x5B, 0x01, 0x0A].into_iter().enumerate() {
                 if self.sf_cc[ch][k] != values[k] {
                     sf.process_midi_message(ch as i32, 0xB0, cc, values[k]);
                     self.sf_cc[ch][k] = values[k];
@@ -1467,6 +1491,7 @@ impl Engine {
             release: release_multiplier(s.release.get()),
             reverb: s.reverb.get().clamp(0.0, 1.0),
             gain: 1.0,
+            pan: 0.0,
         }
     }
 
@@ -1541,7 +1566,8 @@ impl Engine {
                     r += s;
                 }
                 self.volume += (volume_target - self.volume) * volume_coef;
-                let y = self.limiter.process([l * self.volume, r * self.volume]);
+                let y = self.compressor.process([l * self.volume, r * self.volume]);
+                let y = self.limiter.process(y);
                 out[(done + i) * 2] = y[0];
                 out[(done + i) * 2 + 1] = y[1];
             }

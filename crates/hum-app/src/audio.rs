@@ -260,6 +260,11 @@ impl AudioHost {
         Some(presets)
     }
 
+    /// The loaded SoundFont, if any (for offline export).
+    pub fn soundfont(&self) -> Option<Arc<SoundFont>> {
+        self.soundfont.clone()
+    }
+
     /// Give the current engine a SoundFont player if it has none yet. The
     /// player is built here (allocation) and only moved to the audio thread.
     pub fn deliver_synth(&mut self) {

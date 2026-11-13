@@ -5,6 +5,7 @@ mod audio;
 mod catalog;
 #[cfg(not(target_os = "android"))]
 mod devshots;
+mod export;
 mod icons;
 mod input;
 mod keyboard;

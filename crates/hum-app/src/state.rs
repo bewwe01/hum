@@ -34,6 +34,10 @@ pub struct LoopLayer {
     pub volume: f32,
     /// Snap notes to the nearest sixteenth when playing back.
     pub tidy: bool,
+    /// -1 (left) .. 1 (right).
+    pub pan: f32,
+    /// Reverb send, 0..1.
+    pub reverb: f32,
     pub notes: Vec<LoopNote>,
 }
 
@@ -44,6 +48,8 @@ impl Default for LoopLayer {
             muted: false,
             volume: 1.0,
             tidy: false,
+            pan: 0.0,
+            reverb: 0.3,
             notes: Vec::new(),
         }
     }
@@ -177,6 +183,12 @@ impl Saved {
                     layer.sound = d.sound.clone();
                 }
                 layer.volume = unit(layer.volume, 1.0);
+                layer.reverb = unit(layer.reverb, 0.3);
+                layer.pan = if layer.pan.is_finite() {
+                    layer.pan.clamp(-1.0, 1.0)
+                } else {
+                    0.0
+                };
                 layer
                     .notes
                     .retain(|n| n.on.is_finite() && n.off.is_finite());
