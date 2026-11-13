@@ -110,7 +110,6 @@ impl Style {
 }
 
 pub const TITLE: Style = grotesk(30.0, 700);
-pub const CAPTION: Style = inter(12.0, 400);
 pub const SECTION: Style = inter(12.0, 600).tracked(0.06);
 
 /// Lay out a single line of text.

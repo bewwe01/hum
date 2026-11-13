@@ -1,10 +1,30 @@
 //! Hum: UI and audio glue. The synth itself lives in `hum-engine`.
 
 mod app;
-#[allow(dead_code)]
+mod audio;
+#[cfg(not(target_os = "android"))]
+mod devshots;
+mod icons;
+mod input;
+mod platform;
+mod screens;
+mod state;
 mod theme;
+mod widgets;
 
 pub use app::HumApp;
+
+use std::rc::Rc;
+
+use app::Hooks;
+use platform::Platform;
+
+/// Version shown in Settings. Release builds set `HUM_VERSION` from the git
+/// tag; other builds fall back to the crate version.
+pub const VERSION: &str = match option_env!("HUM_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
 
 use eframe::egui;
 use winit::application::ApplicationHandler;
@@ -14,16 +34,28 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 /// (suspend / resume) that eframe does not forward to the app.
 struct Lifecycle<'a> {
     inner: eframe::EframeWinitApplication<'a>,
+    hooks: Rc<Hooks>,
 }
 
 impl ApplicationHandler<eframe::UserEvent> for Lifecycle<'_> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         log::info!("lifecycle: resumed");
+        // Back in the foreground: reopen the audio stream. (On the very
+        // first resume the app does not exist yet; it opens the stream
+        // itself when it is created.)
+        if let Some(audio) = self.hooks.audio.borrow_mut().as_mut() {
+            audio.start();
+        }
         self.inner.resumed(event_loop);
     }
 
     fn suspended(&mut self, event_loop: &ActiveEventLoop) {
         log::info!("lifecycle: suspended");
+        // In the background: stop making sound and release the audio device.
+        if let Some(audio) = self.hooks.audio.borrow_mut().as_mut() {
+            audio.stop();
+        }
+        self.hooks.was_suspended.set(true);
         self.inner.suspended(event_loop);
     }
 
@@ -66,17 +98,28 @@ impl ApplicationHandler<eframe::UserEvent> for Lifecycle<'_> {
     }
 }
 
-fn run(event_loop: EventLoop<eframe::UserEvent>, options: eframe::NativeOptions) {
+fn run(
+    event_loop: EventLoop<eframe::UserEvent>,
+    options: eframe::NativeOptions,
+    platform: Platform,
+) {
+    let hooks = Rc::new(Hooks::default());
+    let app_hooks = hooks.clone();
     let inner = eframe::create_native(
         "Hum",
         options,
-        Box::new(|cc| Ok(Box::new(HumApp::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(HumApp::new(cc, platform, app_hooks)))),
         &event_loop,
     );
-    let mut app = Lifecycle { inner };
+    let mut app = Lifecycle {
+        inner,
+        hooks: hooks.clone(),
+    };
     if let Err(err) = event_loop.run_app(&mut app) {
         log::error!("event loop ended with an error: {err}");
     }
+    // Close the audio stream before the process winds down.
+    hooks.audio.borrow_mut().take();
 }
 
 /// Desktop dev mode: a 390x844 window, the mouse acts as a finger.
@@ -87,13 +130,13 @@ pub fn desktop_main() {
         viewport: egui::ViewportBuilder::default()
             .with_title("Hum")
             .with_inner_size([390.0, 844.0])
-            .with_min_inner_size([320.0, 560.0]),
+            .with_min_inner_size([320.0, 600.0]),
         ..Default::default()
     };
     let event_loop = EventLoop::<eframe::UserEvent>::with_user_event()
         .build()
         .expect("failed to create the event loop");
-    run(event_loop, options);
+    run(event_loop, options, Platform::desktop());
 }
 
 /// Android entry point, called by android-activity's NativeActivity glue.
@@ -111,9 +154,10 @@ fn android_main(app: winit::platform::android::activity::AndroidApp) {
         android_app: Some(app.clone()),
         ..Default::default()
     };
+    let platform = Platform::android(app.clone());
     let event_loop = EventLoop::<eframe::UserEvent>::with_user_event()
         .with_android_app(app)
         .build()
         .expect("failed to create the event loop");
-    run(event_loop, options);
+    run(event_loop, options, platform);
 }

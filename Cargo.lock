@@ -1058,6 +1058,7 @@ dependencies = [
  "hum-engine",
  "jni",
  "log",
+ "ndk-context",
  "rtrb",
  "serde",
  "serde_json",
