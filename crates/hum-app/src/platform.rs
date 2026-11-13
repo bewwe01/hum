@@ -56,9 +56,9 @@ impl Platform {
     }
 }
 
-/// Every call into the Android framework runs on one background thread, so
-/// a slow or blocking system call can never freeze the UI. The UI only
-/// queues requests and reads cached results.
+/// Every call into the Android framework is posted to the Java main thread
+/// (see `android_worker`), so it can never block or deadlock the UI. The UI
+/// only queues requests and reads cached results.
 #[cfg(target_os = "android")]
 impl Platform {
     pub fn android(app: winit::platform::android::activity::AndroidApp) -> Self {
@@ -101,13 +101,22 @@ impl Platform {
     }
 }
 
+/// Runs platform jobs on Android's Java main (UI) thread.
+///
+/// Why not call android-activity directly from the UI code: while the app's
+/// event-loop callbacks run, android-activity holds a read lock on its
+/// state, and `AndroidApp::set_window_flags` takes the write lock on that
+/// same lock. Calling it from inside the event loop deadlocks forever (the
+/// black screen and ANR in v0.1.0); calling it from another thread
+/// deadlocks the next frame instead. Posting work to the Java main thread
+/// only needs the read lock, and window/view calls belong on that thread
+/// anyway.
 #[cfg(target_os = "android")]
 mod android_worker {
     use super::{jni_glue, Insets};
-    use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
     use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
-    use winit::platform::android::activity::{AndroidApp, WindowManagerFlags as Flags};
+    use std::time::Instant;
+    use winit::platform::android::activity::AndroidApp;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum Job {
@@ -120,68 +129,56 @@ mod android_worker {
 
     #[derive(Clone)]
     pub struct Worker {
-        tx: SyncSender<Job>,
+        app: AndroidApp,
         insets: Arc<Mutex<Insets>>,
+        seen: Arc<Mutex<Vec<Job>>>,
     }
 
     impl Worker {
         pub fn start(app: AndroidApp) -> Self {
-            let (tx, rx) = sync_channel::<Job>(64);
-            let insets = Arc::new(Mutex::new(Insets::default()));
-            let shared = insets.clone();
-            let spawned = std::thread::Builder::new()
-                .name("hum-platform".into())
-                .spawn(move || {
-                    let sdk = AndroidApp::sdk_version();
-                    jni_glue::set_target(app.vm_as_ptr(), app.activity_as_ptr());
-                    let mut seen: Vec<Job> = Vec::new();
-                    while let Ok(job) = rx.recv() {
-                        let first = !seen.contains(&job);
-                        if first {
-                            seen.push(job);
-                            log::info!("platform: first {job:?}");
-                        }
-                        let started = Instant::now();
-                        match job {
-                            Job::Haptic => jni_glue::haptic_tick(),
-                            Job::KeepScreenOn(on) => {
-                                if on {
-                                    app.set_window_flags(Flags::KEEP_SCREEN_ON, Flags::empty());
-                                } else {
-                                    app.set_window_flags(Flags::empty(), Flags::KEEP_SCREEN_ON);
-                                }
-                            }
-                            Job::AudioFocus(focused) => jni_glue::audio_focus(focused),
-                            Job::Leave => jni_glue::move_task_to_back(),
-                            Job::RefreshInsets => {
-                                if let Some(value) = jni_glue::insets(sdk) {
-                                    if let Ok(mut slot) = shared.lock() {
-                                        *slot = value;
-                                    }
-                                }
-                            }
-                        }
-                        let took = started.elapsed();
-                        if first {
-                            log::info!("platform: {job:?} done in {} ms", took.as_millis());
-                        } else if took > Duration::from_millis(200) {
-                            log::warn!("platform: {job:?} took {} ms", took.as_millis());
-                        }
-                    }
-                });
-            if let Err(err) = spawned {
-                log::error!("could not start the platform thread: {err}");
+            jni_glue::set_target(app.vm_as_ptr(), app.activity_as_ptr());
+            Self {
+                app,
+                insets: Arc::default(),
+                seen: Arc::default(),
             }
-            Self { tx, insets }
         }
 
-        /// Queue a job without ever blocking (dropped if the queue is full).
+        /// Post a job to the Java main thread; never blocks the caller.
         pub fn send(&self, job: Job) {
-            match self.tx.try_send(job) {
-                Ok(()) => {}
-                Err(TrySendError::Full(_)) => log::warn!("platform: queue full, dropped {job:?}"),
-                Err(TrySendError::Disconnected(_)) => {}
-            }
+            let insets = self.insets.clone();
+            let seen = self.seen.clone();
+            self.app.run_on_java_main_thread(Box::new(move || {
+                let first = seen.lock().map(|mut s| {
+                    let first = !s.contains(&job);
+                    if first {
+                        s.push(job);
+                    }
+                    first
+                });
+                let first = first.unwrap_or(false);
+                let started = Instant::now();
+                match job {
+                    Job::Haptic => jni_glue::haptic_tick(),
+                    Job::KeepScreenOn(on) => jni_glue::keep_screen_on(on),
+                    Job::AudioFocus(focused) => jni_glue::audio_focus(focused),
+                    Job::Leave => jni_glue::move_task_to_back(),
+                    Job::RefreshInsets => {
+                        let sdk = AndroidApp::sdk_version();
+                        if let Some(value) = jni_glue::insets(sdk) {
+                            if let Ok(mut slot) = insets.lock() {
+                                *slot = value;
+                            }
+                        }
+                    }
+                }
+                if first {
+                    log::info!(
+                        "platform: first {job:?} took {} ms",
+                        started.elapsed().as_millis()
+                    );
+                }
+            }));
         }
 
         pub fn insets(&self) -> Insets {
@@ -314,6 +311,36 @@ mod jni_glue {
                 )?
                 .i()
             }
+        });
+    }
+
+    /// `WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON`.
+    const FLAG_KEEP_SCREEN_ON: i32 = 0x80;
+
+    /// Add or clear FLAG_KEEP_SCREEN_ON on the Activity's window. Must run on
+    /// the Java main thread.
+    pub fn keep_screen_on(on: bool) {
+        with_activity(|env, activity| {
+            let window = env
+                .call_method(
+                    activity,
+                    jni_str!("getWindow"),
+                    jni_sig!("()Landroid/view/Window;"),
+                    &[],
+                )?
+                .l()?;
+            let method = if on {
+                jni_str!("addFlags")
+            } else {
+                jni_str!("clearFlags")
+            };
+            env.call_method(
+                &window,
+                method,
+                jni_sig!("(I)V"),
+                &[JValue::Int(FLAG_KEEP_SCREEN_ON)],
+            )?;
+            Ok(())
         });
     }
 

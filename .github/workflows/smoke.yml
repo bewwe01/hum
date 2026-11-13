@@ -116,10 +116,12 @@ jobs:
           a shell am start -n com.example.hum/android.app.NativeActivity
           sleep 20
           timeout 30 "$adb" exec-out screencap -p > results/1-after-launch.png
-          # Tap a key on the keyboard area (lower middle of a 1080x2400 screen).
-          a shell input tap 540 1900
-          sleep 2
-          timeout 30 "$adb" exec-out screencap -p > results/2-after-tap.png
+          # Hold a key (lower middle of the 1080x2400 screen) for 3 s and take
+          # a screenshot while it is down: the pressed key must light up.
+          timeout 20 "$adb" shell input swipe 540 1840 540 1840 3000 &
+          sleep 1.5
+          timeout 30 "$adb" exec-out screencap -p > results/2-key-held.png
+          wait
           a shell input tap 540 2280
           sleep 8
           timeout 30 "$adb" exec-out screencap -p > results/3-later.png
@@ -148,6 +150,38 @@ jobs:
           done
           echo "== resumed activity"
           grep -E "mResumedActivity|topResumedActivity" results/activities.txt | head -n 5 || true
+
+      - name: Check the results
+        run: |
+          python3 -m pip install --quiet --user pillow
+          python3 - <<'PY'
+          import re, sys
+          from PIL import Image
+          ok = True
+          log = open("results/logcat.txt", errors="replace").read()
+          for pattern, what in [
+              (r"ANR in com\.example\.hum", "an ANR (app not responding)"),
+              (r"panicked at", "a Rust panic"),
+              (r"watchdog: UI thread stuck", "a watchdog report"),
+              (r"FATAL EXCEPTION|Fatal signal", "a crash"),
+          ]:
+              if re.search(pattern, log):
+                  print(f"FAIL: logcat shows {what}"); ok = False
+          def colors(path):
+              img = Image.open(path).convert("RGB").resize((270, 600))
+              return img, len(set(img.getdata()))
+          launch, n = colors("results/1-after-launch.png")
+          print(f"after launch: {n} distinct colours")
+          if n < 40:
+              print("FAIL: the screen looks blank"); ok = False
+          held, _ = colors("results/2-key-held.png")
+          diff = sum(1 for a, b in zip(launch.getdata(), held.getdata()) if a != b)
+          print(f"key held: {diff} pixels differ from the launch screen")
+          if diff < 200:
+              print("FAIL: holding a key did not change the screen"); ok = False
+          print("PASS" if ok else "FAILED")
+          sys.exit(0 if ok else 1)
+          PY
 
       - name: Upload results
         if: always()
