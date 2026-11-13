@@ -90,6 +90,9 @@ jobs:
           # cannot stall the job; failures are logged and the run goes on.
           a() { echo "+ adb $*" >&2; timeout 90 "$adb" "$@" || echo "  (adb $1 failed or timed out: $?)" >&2; }
           mkdir -p results
+          trap 'cp emulator.log results/ 2>/dev/null; echo "== emulator.log (tail)"; tail -n 80 emulator.log' EXIT
+          ls -l /dev/kvm || true
+          "$ANDROID_HOME/emulator/emulator" -accel-check || true
           timeout 300 "$adb" wait-for-device
           for i in $(seq 1 150); do
             [ "$(timeout 10 "$adb" shell getprop sys.boot_completed | tr -d '\r')" = "1" ] && break
