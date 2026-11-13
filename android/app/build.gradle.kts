@@ -38,6 +38,11 @@ android {
     packaging {
         jniLibs {
             useLegacyPackaging = false
+            // -PhumKeepSymbols=true keeps function names in the native library
+            // so crash and hang stack traces are readable (smoke tests only).
+            if (providers.gradleProperty("humKeepSymbols").orNull == "true") {
+                keepDebugSymbols += "**/*.so"
+            }
         }
     }
 }

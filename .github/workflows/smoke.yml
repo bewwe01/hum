@@ -1,0 +1,133 @@
+name: Smoke test (emulator)
+
+# Boots an Android emulator, installs a debug build, launches Hum, taps it,
+# and collects a screenshot, logcat and stack traces of every thread. The
+# arm64 build runs on the x86_64 emulator through Android's built-in ARM
+# translation. Start it from the Actions tab; results are in the
+# "smoke-results" artifact.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  ANDROID_NDK_VERSION: "27.3.13750724"
+  ANDROID_PLATFORM: "android-36"
+  ANDROID_BUILD_TOOLS: "36.0.0"
+  ANDROID_MIN_SDK: "26"
+  CARGO_NDK_VERSION: "4.1.2"
+  SYSTEM_IMAGE: "system-images;android-35;google_apis;x86_64"
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Select JDK 21
+        run: echo "JAVA_HOME=$JAVA_HOME_21_X64" >> "$GITHUB_ENV"
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Install Android SDK packages and the emulator
+        run: |
+          sdk="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$sdk" --licenses > /dev/null || true
+          "$sdk" --install "ndk;$ANDROID_NDK_VERSION" "platforms;$ANDROID_PLATFORM" \
+            "build-tools;$ANDROID_BUILD_TOOLS" "emulator" "$SYSTEM_IMAGE" > /dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
+
+      - name: Start the emulator (boots while the app builds)
+        run: |
+          echo no | "$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager" create avd -n smoke -k "$SYSTEM_IMAGE" -d pixel_7 --force
+          nohup "$ANDROID_HOME/emulator/emulator" -avd smoke -no-window -no-audio -no-boot-anim \
+            -no-snapshot -gpu swiftshader_indirect -memory 4096 > emulator.log 2>&1 &
+
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install && rustc --version
+
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ~/.cargo/bin/cargo-ndk
+            target
+          key: smoke-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            smoke-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-
+
+      - name: Build the debug APK (with symbols)
+        run: |
+          command -v cargo-ndk || cargo install cargo-ndk --locked --version "$CARGO_NDK_VERSION"
+          export CARGO_PROFILE_RELEASE_DEBUG=line-tables-only
+          cargo ndk --target arm64-v8a --platform "$ANDROID_MIN_SDK" \
+            --output-dir android/app/src/main/jniLibs \
+            build --package hum-app --lib --release --locked
+          (cd android && ./gradlew --no-daemon assembleDebug -PhumKeepSymbols=true)
+
+      - name: Run Hum on the emulator
+        run: |
+          set -x
+          adb="$ANDROID_HOME/platform-tools/adb"
+          mkdir -p results
+          "$adb" wait-for-device
+          for i in $(seq 1 120); do
+            [ "$("$adb" shell getprop sys.boot_completed | tr -d '\r')" = "1" ] && break
+            sleep 2
+          done
+          "$adb" root || true
+          sleep 3
+          "$adb" wait-for-device
+          "$adb" shell settings put global window_animation_scale 0
+          "$adb" install -r android/app/build/outputs/apk/debug/app-debug.apk
+          "$adb" logcat -c
+          "$adb" shell am start -W -n com.example.hum/android.app.NativeActivity
+          sleep 20
+          "$adb" exec-out screencap -p > results/1-after-launch.png
+          # Tap a key on the keyboard area (lower middle of a 1080x2400 screen).
+          "$adb" shell input tap 540 1900
+          sleep 2
+          "$adb" exec-out screencap -p > results/2-after-tap.png
+          "$adb" shell input tap 540 2280
+          sleep 8
+          "$adb" exec-out screencap -p > results/3-later.png
+          pid="$("$adb" shell pidof com.example.hum | tr -d '\r')"
+          echo "pid=$pid"
+          if [ -n "$pid" ]; then
+            "$adb" shell debuggerd -b "$pid" > results/stacks-native.txt 2>&1 || true
+            "$adb" shell kill -3 "$pid" || true
+            sleep 3
+          fi
+          "$adb" shell 'ls -t /data/anr/ | head -n 3' > results/anr-files.txt 2>&1 || true
+          for f in $("$adb" shell 'ls -t /data/anr/ | head -n 2' | tr -d '\r'); do
+            "$adb" pull "/data/anr/$f" "results/$f" || true
+          done
+          "$adb" logcat -d -v threadtime > results/logcat.txt
+          "$adb" shell dumpsys activity activities | grep -E "mResumedActivity|mFocusedApp" > results/activity.txt || true
+          grep -E " hum |hum_app|ANR in|FATAL|panicked" results/logcat.txt | head -n 80 || true
+          cp emulator.log results/ || true
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: smoke-results
+          path: results/
+          retention-days: 14
