@@ -51,43 +51,46 @@ impl HumApp {
             None
         };
 
-        // ---- overview card -------------------------------------------------
-        let row_h = 12.0;
-        let row_gap = 8.0;
-        let card_h = 28.0 + 4.0 * row_h + 3.0 * row_gap;
-        let card = Rect::from_min_size(pos2(rect.left(), y), vec2(rect.width(), card_h));
-        widgets::surface(&p, card, 22.0, theme::SURFACE, theme::LINE);
-        let cells_left = card.left() + 14.0 + 48.0;
-        let cell_w = (card.right() - 14.0 - cells_left - 15.0 * 3.0) / 16.0;
-        for (drum, name) in DRUM_NAMES.iter().enumerate() {
-            let cy = card.top() + 14.0 + drum as f32 * (row_h + row_gap) + row_h * 0.5;
-            let color = if drum == self.drum {
-                theme::AMBER
-            } else {
-                theme::MUTED
-            };
-            theme::text(
-                &p,
-                pos2(card.left() + 14.0, cy),
-                Align2::LEFT_CENTER,
-                name,
-                inter(12.0, 600),
-                color,
-            );
-            for s in 0..16 {
-                let r = Rect::from_min_size(
-                    pos2(cells_left + s as f32 * (cell_w + 3.0), cy - row_h * 0.5),
-                    vec2(cell_w, row_h),
+        // Landscape is short: the step grid alone shows the pattern.
+        if !self.landscape {
+            // ---- overview card -------------------------------------------------
+            let row_h = 12.0;
+            let row_gap = 8.0;
+            let card_h = 28.0 + 4.0 * row_h + 3.0 * row_gap;
+            let card = Rect::from_min_size(pos2(rect.left(), y), vec2(rect.width(), card_h));
+            widgets::surface(&p, card, 22.0, theme::SURFACE, theme::LINE);
+            let cells_left = card.left() + 14.0 + 48.0;
+            let cell_w = (card.right() - 14.0 - cells_left - 15.0 * 3.0) / 16.0;
+            for (drum, name) in DRUM_NAMES.iter().enumerate() {
+                let cy = card.top() + 14.0 + drum as f32 * (row_h + row_gap) + row_h * 0.5;
+                let color = if drum == self.drum {
+                    theme::AMBER
+                } else {
+                    theme::MUTED
+                };
+                theme::text(
+                    &p,
+                    pos2(card.left() + 14.0, cy),
+                    Align2::LEFT_CENTER,
+                    name,
+                    inter(12.0, 600),
+                    color,
                 );
-                let on = self.st.patterns[drum] >> s & 1 == 1;
-                let mut color = if on { theme::VIOLET } else { theme::LINE };
-                if step == Some(s) {
-                    color = if on { theme::AMBER } else { theme::BAR_LINE };
+                for s in 0..16 {
+                    let r = Rect::from_min_size(
+                        pos2(cells_left + s as f32 * (cell_w + 3.0), cy - row_h * 0.5),
+                        vec2(cell_w, row_h),
+                    );
+                    let on = self.st.patterns[drum] >> s & 1 == 1;
+                    let mut color = if on { theme::VIOLET } else { theme::LINE };
+                    if step == Some(s) {
+                        color = if on { theme::AMBER } else { theme::BAR_LINE };
+                    }
+                    p.rect_filled(r, 4.0, color);
                 }
-                p.rect_filled(r, 4.0, color);
             }
+            y += card_h + GAP;
         }
-        y += card_h + GAP;
 
         // ---- drum chips ----------------------------------------------------
         let gap = 8.0;
@@ -204,13 +207,14 @@ impl HumApp {
             pos2(rect.left(), y),
             pos2(rect.right(), transport.top() - GAP),
         );
-        let pad_w = (grid.width() - gap * 3.0) / 4.0;
-        let pad_h = ((grid.height() - gap * 3.0) / 4.0).max(24.0);
+        let (cols, rows) = if self.landscape { (8, 2) } else { (4, 4) };
+        let pad_w = (grid.width() - gap * (cols as f32 - 1.0)) / cols as f32;
+        let pad_h = ((grid.height() - gap * (rows as f32 - 1.0)) / rows as f32).max(24.0);
         for s in 0..16usize {
             let r = Rect::from_min_size(
                 pos2(
-                    grid.left() + (s % 4) as f32 * (pad_w + gap),
-                    grid.top() + (s / 4) as f32 * (pad_h + gap),
+                    grid.left() + (s % cols) as f32 * (pad_w + gap),
+                    grid.top() + (s / cols) as f32 * (pad_h + gap),
                 ),
                 vec2(pad_w, pad_h),
             );

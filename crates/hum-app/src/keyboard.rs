@@ -1,8 +1,9 @@
 //! The playing surface: four modes sharing one multi-touch engine.
 //!
-//! * Scale: seven keys locked to the scale (they go through the engine's
+//! * Scale: seven keys (fourteen on wide screens) locked to the scale (they go through the engine's
 //!   key map, so arpeggiator sounds arpeggiate).
-//! * Piano: an octave and one note, with black keys.
+//! * Piano: as many keys as fit (an octave and one note on a phone held
+//!   upright, two octaves or more in landscape), with black keys.
 //! * Chords: one triad per scale degree.
 //! * Drums: eight pads on the General MIDI drum notes.
 //!
@@ -19,7 +20,7 @@ use crate::app::HumApp;
 use crate::theme::{self, grotesk, inter};
 use crate::widgets;
 
-pub const MAX_ZONES: usize = 16;
+pub const MAX_ZONES: usize = 64;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub enum PlayMode {
@@ -115,13 +116,18 @@ fn zones(mode: PlayMode, map: KeyMap, rect: Rect) -> Vec<Zone> {
     match mode {
         PlayMode::Scale | PlayMode::Chords => {
             let gap = 6.0;
-            let w = (rect.width() - gap * 6.0) / 7.0;
+            let n: u8 = if mode == PlayMode::Scale && rect.width() >= 600.0 {
+                14
+            } else {
+                7
+            };
+            let w = (rect.width() - gap * f32::from(n - 1)) / f32::from(n);
             let chord_map = KeyMap {
                 scale: chord_scale(map.scale),
                 locked: true,
                 ..map
             };
-            for k in 0..7u8 {
+            for k in 0..n {
                 let r = Rect::from_min_size(
                     pos2(rect.left() + f32::from(k) * (w + gap), rect.top()),
                     vec2(w, rect.height()),
@@ -163,14 +169,22 @@ fn zones(mode: PlayMode, map: KeyMap, rect: Rect) -> Vec<Zone> {
             }
         }
         PlayMode::Piano => {
-            const WHITE: [u8; 8] = [0, 2, 4, 5, 7, 9, 11, 12];
-            const BLACK: [(u8, usize); 5] = [(1, 0), (3, 1), (6, 3), (8, 4), (10, 5)];
-            let base = 12 * (map.octave.clamp(1, 6) as u8 + 1);
+            const STEPS: [u8; 7] = [0, 2, 4, 5, 7, 9, 11];
+            // White keys at least ~44 points wide: 8 on a phone held upright,
+            // 15 or more (two octaves) in landscape.
+            let whites = ((rect.width() / 44.0) as usize).clamp(8, 36);
+            let lower = if whites >= 15 { 1 } else { 0 };
+            let octave = (map.octave.clamp(1, 6) - lower).max(0) as u8;
+            let base = 12 * (octave + 1);
+            let white_note = |i: usize| (base + 12 * (i / 7) as u8 + STEPS[i % 7]).min(127);
             let gap = 3.0;
-            let w = (rect.width() - gap * 7.0) / 8.0;
+            let w = (rect.width() - gap * (whites as f32 - 1.0)) / whites as f32;
             // Black keys first: they sit on top and win the hit test.
-            for (semi, after) in BLACK {
-                let note = base + semi;
+            for after in 0..whites - 1 {
+                if !matches!(after % 7, 0 | 1 | 3 | 4 | 5) {
+                    continue;
+                }
+                let note = white_note(after) + 1;
                 let x = rect.left() + (after as f32 + 1.0) * (w + gap) - gap / 2.0;
                 let (in_scale, root) = scale_notes(note);
                 out.push(Zone {
@@ -189,8 +203,8 @@ fn zones(mode: PlayMode, map: KeyMap, rect: Rect) -> Vec<Zone> {
                     in_scale,
                 });
             }
-            for (i, semi) in WHITE.iter().enumerate() {
-                let note = base + semi;
+            for i in 0..whites {
+                let note = white_note(i);
                 let (in_scale, root) = scale_notes(note);
                 out.push(Zone {
                     rect: Rect::from_min_size(

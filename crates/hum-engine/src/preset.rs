@@ -11,10 +11,11 @@ pub enum Category {
     Fx,
     Retro,
     Drums,
+    Wind,
 }
 
 impl Category {
-    pub const ALL: [Category; 8] = [
+    pub const ALL: [Category; 9] = [
         Category::Leads,
         Category::Pads,
         Category::Bass,
@@ -23,6 +24,7 @@ impl Category {
         Category::Fx,
         Category::Retro,
         Category::Drums,
+        Category::Wind,
     ];
 
     pub fn name(self) -> &'static str {
@@ -35,6 +37,7 @@ impl Category {
             Category::Fx => "FX",
             Category::Retro => "Retro",
             Category::Drums => "Drums",
+            Category::Wind => "Wind",
         }
     }
 }

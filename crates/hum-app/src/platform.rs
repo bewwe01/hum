@@ -72,6 +72,13 @@ impl Platform {
 
     pub fn set_keep_screen_on(&self, _on: bool) {}
 
+    /// Read the clipboard's text. The desktop build has no clipboard
+    /// support; for development it reads the file named by `HUM_PASTE_FILE`.
+    pub fn request_paste(&self, done: std::sync::mpsc::Sender<Option<String>>) {
+        let text = std::env::var_os("HUM_PASTE_FILE").and_then(|p| std::fs::read_to_string(p).ok());
+        let _ = done.send(text);
+    }
+
     pub fn set_audio_focus(&self, _focused: bool) {}
 
     /// The system back action on the first screen. Nothing to do on desktop.
@@ -123,6 +130,15 @@ impl Platform {
     /// the system's "touch feedback" setting.
     pub fn haptic_tick(&self) {
         self.worker.send(android_worker::Job::Haptic);
+    }
+
+    /// Read the clipboard's text (on the Java main thread; the answer comes
+    /// back through `done`). Reading the clipboard needs no permission while
+    /// the app is in the foreground.
+    pub fn request_paste(&self, done: std::sync::mpsc::Sender<Option<String>>) {
+        self.app.run_on_java_main_thread(Box::new(move || {
+            let _ = done.send(jni_glue::clipboard_text());
+        }));
     }
 
     pub fn set_keep_screen_on(&self, on: bool) {
@@ -366,6 +382,72 @@ mod jni_glue {
 
     /// Add or clear FLAG_KEEP_SCREEN_ON on the Activity's window. Must run on
     /// the Java main thread.
+    /// The clipboard's first item as text, if any.
+    pub fn clipboard_text() -> Option<String> {
+        with_activity(|env, activity| {
+            let name = env.new_string("clipboard")?;
+            let manager = env
+                .call_method(
+                    activity,
+                    jni_str!("getSystemService"),
+                    jni_sig!("(Ljava/lang/String;)Ljava/lang/Object;"),
+                    &[JValue::Object(&name)],
+                )?
+                .l()?;
+            if manager.is_null() {
+                return Ok(None);
+            }
+            let clip = env
+                .call_method(
+                    &manager,
+                    jni_str!("getPrimaryClip"),
+                    jni_sig!("()Landroid/content/ClipData;"),
+                    &[],
+                )?
+                .l()?;
+            if clip.is_null() {
+                return Ok(None);
+            }
+            let count = env
+                .call_method(&clip, jni_str!("getItemCount"), jni_sig!("()I"), &[])?
+                .i()?;
+            if count < 1 {
+                return Ok(None);
+            }
+            let item = env
+                .call_method(
+                    &clip,
+                    jni_str!("getItemAt"),
+                    jni_sig!("(I)Landroid/content/ClipData$Item;"),
+                    &[JValue::Int(0)],
+                )?
+                .l()?;
+            let text = env
+                .call_method(
+                    &item,
+                    jni_str!("coerceToText"),
+                    jni_sig!("(Landroid/content/Context;)Ljava/lang/CharSequence;"),
+                    &[JValue::Object(activity)],
+                )?
+                .l()?;
+            if text.is_null() {
+                return Ok(None);
+            }
+            let string = env
+                .call_method(
+                    &text,
+                    jni_str!("toString"),
+                    jni_sig!("()Ljava/lang/String;"),
+                    &[],
+                )?
+                .l()?;
+            // SAFETY: `toString` returns a java.lang.String.
+            let string = unsafe { jni::objects::JString::from_raw(env, string.into_raw()) };
+            Ok(Some(string.to_string()))
+        })
+        .flatten()
+    }
+
     pub fn keep_screen_on(on: bool) {
         with_activity(|env, activity| {
             let window = env

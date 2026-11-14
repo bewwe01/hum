@@ -6,6 +6,7 @@
 //! * [`presets::PRESETS`] is the table of the 56 built-in sounds.
 //! * [`scale`] maps the seven on-screen keys to notes.
 
+pub mod chords;
 pub mod dsp;
 pub mod engine;
 pub mod fx;

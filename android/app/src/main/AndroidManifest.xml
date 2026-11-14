@@ -18,7 +18,7 @@
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|density|uiMode|fontScale"
             android:exported="true"
             android:launchMode="singleTask"
-            android:screenOrientation="portrait"
+            android:screenOrientation="fullUser"
             android:windowSoftInputMode="adjustNothing">
             <meta-data
                 android:name="android.app.lib_name"

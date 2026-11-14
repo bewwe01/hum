@@ -45,17 +45,19 @@ impl Hooks {
 pub enum Tab {
     Play,
     Sounds,
+    Songs,
     Loop,
     Beats,
 }
 
 impl Tab {
-    const ALL: [Tab; 4] = [Tab::Play, Tab::Sounds, Tab::Loop, Tab::Beats];
+    const ALL: [Tab; 5] = [Tab::Play, Tab::Sounds, Tab::Songs, Tab::Loop, Tab::Beats];
 
     fn label(self) -> &'static str {
         match self {
             Tab::Play => "Play",
             Tab::Sounds => "Sounds",
+            Tab::Songs => "Songs",
             Tab::Loop => "Loop",
             Tab::Beats => "Beats",
         }
@@ -125,6 +127,14 @@ pub struct HumApp {
 
     bpm_repeat_at: f64,
 
+    /// The screen is wider than tall: tabs on a side rail, wide layouts.
+    pub(crate) landscape: bool,
+    /// The sound and legato setting the engine's live part last got.
+    applied_sound: Option<hum_engine::engine::SoundId>,
+    applied_mono: Option<bool>,
+    // Songs screen.
+    pub(crate) songs: crate::screens::SongsUi,
+
     #[cfg(not(target_os = "android"))]
     pub(crate) shots: Option<crate::devshots::Shots>,
 }
@@ -186,6 +196,10 @@ impl HumApp {
             drum: 0,
             rng: 0x2545_F491,
             bpm_repeat_at: 0.0,
+            landscape: false,
+            applied_sound: None,
+            applied_mono: None,
+            songs: crate::screens::SongsUi::default(),
             #[cfg(not(target_os = "android"))]
             shots: crate::devshots::Shots::from_env(),
         };
@@ -210,7 +224,8 @@ impl HumApp {
     /// whenever a fresh engine was created).
     fn sync_engine(&mut self) {
         self.push_params();
-        self.send(Cmd::SetSound(self.instrument().sound));
+        self.applied_sound = None;
+        self.applied_mono = None;
         self.send(Cmd::SetKeyMap(self.st.keymap()));
         self.send(Cmd::SetBpm(self.st.bpm));
         self.send(Cmd::Metronome(self.st.metronome));
@@ -262,12 +277,39 @@ impl HumApp {
         self.st.pad_y = hum_engine::engine::PAD_Y_DEFAULT;
         self.trail.clear();
         self.push_params();
-        self.send(Cmd::SetSound(inst.sound));
+        self.apply_live_sound();
         // Drum kits get drum pads; leaving a kit goes back to the scale keys.
         if inst.drums {
             self.st.play_mode = PlayMode::Drums;
         } else if self.st.play_mode == PlayMode::Drums {
             self.st.play_mode = PlayMode::Scale;
+        }
+    }
+
+    /// Keep the engine's live sound and legato mode in step with the
+    /// screen: the song's instrument on the Songs screen, else the chosen
+    /// sound.
+    pub(crate) fn apply_live_sound(&mut self) {
+        let (sound, mono) = match self.song_sound() {
+            Some(sound) => (sound, false),
+            None => {
+                let inst = self.instrument();
+                let mono = match self.st.legato {
+                    crate::state::Legato::Auto => inst.group == Group::Wind,
+                    crate::state::Legato::On => !inst.drums,
+                    crate::state::Legato::Off => false,
+                };
+                (inst.sound, mono)
+            }
+        };
+        if self.applied_sound != Some(sound) {
+            self.release_all_keys();
+            self.send(Cmd::SetSound(sound));
+            self.applied_sound = Some(sound);
+        }
+        if self.applied_mono != Some(mono) {
+            self.send(Cmd::SetMono(mono));
+            self.applied_mono = Some(mono);
         }
     }
 
@@ -422,7 +464,7 @@ impl HumApp {
         if self.now < self.next_inset_poll {
             return;
         }
-        // Insets change rarely (rotation is locked); poll gently.
+        // Insets change rarely (on rotation); poll gently.
         self.next_inset_poll = self.now + 0.5;
         let ppp = ctx.pixels_per_point().max(0.1);
         let i = self.platform.insets();
@@ -462,6 +504,8 @@ impl HumApp {
         watchdog.enter(Stage::Audio);
         self.pump_audio(&ctx);
         self.poll_export();
+        self.apply_live_sound();
+        self.poll_paste();
         watchdog.enter(Stage::Insets);
         self.poll_insets(&ctx);
         watchdog.enter(Stage::Draw);
@@ -479,18 +523,38 @@ impl HumApp {
             safe.max - vec2(theme::PAD, theme::PAD_BOTTOM),
         );
 
+        self.landscape = safe.width() > safe.height() * 1.15;
+        // Landscape screens are short: smaller margins.
+        let content = if self.landscape {
+            Rect::from_min_max(
+                safe.min + vec2(theme::PAD * 0.6, 10.0),
+                safe.max - vec2(theme::PAD * 0.6, 10.0),
+            )
+        } else {
+            content
+        };
+
         // A modal sheet blocks the screen underneath.
         self.touches.set_blocked(self.sheet.is_some());
         if self.settings_open {
             self.settings_screen(ui, content);
         } else {
-            let bar =
-                Rect::from_min_max(pos2(content.left(), content.bottom() - 64.0), content.max);
-            let body =
-                Rect::from_min_max(content.min, pos2(content.right(), bar.top() - theme::GAP));
+            let (bar, body) = if self.landscape {
+                let bar =
+                    Rect::from_min_max(content.min, pos2(content.left() + 76.0, content.bottom()));
+                let body = Rect::from_min_max(pos2(bar.right() + 12.0, content.top()), content.max);
+                (bar, body)
+            } else {
+                let bar =
+                    Rect::from_min_max(pos2(content.left(), content.bottom() - 64.0), content.max);
+                let body =
+                    Rect::from_min_max(content.min, pos2(content.right(), bar.top() - theme::GAP));
+                (bar, body)
+            };
             match self.tab {
                 Tab::Play => self.play_screen(ui, body),
                 Tab::Sounds => self.sounds_screen(ui, body),
+                Tab::Songs => self.songs_screen(ui, body),
                 Tab::Loop => self.loop_screen(ui, body),
                 Tab::Beats => self.beats_screen(ui, body),
             }
@@ -511,7 +575,7 @@ impl HumApp {
         // Repaint only while something moves or is being touched.
         let transport_visible = self.status.running
             && !self.settings_open
-            && matches!(self.tab, Tab::Loop | Tab::Beats);
+            && matches!(self.tab, Tab::Loop | Tab::Beats | Tab::Songs);
         if self.touches.any_active() || !self.trail.is_empty() || transport_visible {
             ctx.request_repaint();
         }
@@ -544,6 +608,8 @@ impl HumApp {
             self.sheet = None;
         } else if self.settings_open {
             self.settings_open = false;
+        } else if self.tab == Tab::Songs && self.songs_back() {
+            // The Songs screen closed its editor or song.
         } else if self.tab != Tab::Play {
             self.tab = Tab::Play;
         } else {
@@ -555,16 +621,29 @@ impl HumApp {
     // ------------------------------------------------------------------
     // Shared widgets
 
+    /// The tab bar along the bottom, or a rail down the left side in
+    /// landscape.
     fn tab_bar(&mut self, p: &Painter, rect: Rect) {
         widgets::surface(p, rect, 24.0, theme::SURFACE, theme::LINE);
         let inner = rect.shrink(6.0);
         let gap = 4.0;
-        let w = (inner.width() - gap * 3.0) / 4.0;
+        let n = Tab::ALL.len() as f32;
+        let vertical = rect.height() > rect.width();
         for (i, tab) in Tab::ALL.iter().enumerate() {
-            let r = Rect::from_min_size(
-                pos2(inner.left() + i as f32 * (w + gap), inner.top()),
-                vec2(w, inner.height()),
-            );
+            let r = if vertical {
+                let h = ((inner.height() - gap * (n - 1.0)) / n).min(72.0);
+                let top = inner.center().y - (h * n + gap * (n - 1.0)) / 2.0;
+                Rect::from_min_size(
+                    pos2(inner.left(), top + i as f32 * (h + gap)),
+                    vec2(inner.width(), h),
+                )
+            } else {
+                let w = (inner.width() - gap * (n - 1.0)) / n;
+                Rect::from_min_size(
+                    pos2(inner.left() + i as f32 * (w + gap), inner.top()),
+                    vec2(w, inner.height()),
+                )
+            };
             let tap = self.touches.button(Id::unique(("tab", i)), r);
             if tap.clicked && self.tab != *tab {
                 self.tab = *tab;
@@ -577,17 +656,21 @@ impl HumApp {
                 p.rect_filled(r, 18.0, theme::SURFACE_2);
             }
             let color = if active { theme::AMBER } else { theme::MUTED };
-            let icon_c = pos2(r.center().x, r.top() + 18.0);
+            let icon_c = pos2(r.center().x, r.center().y - 8.0);
             match tab {
                 Tab::Play => icons::keys(p, icon_c, 24.0, color),
                 Tab::Sounds => icons::bars(p, icon_c, 24.0, color),
+                Tab::Songs => icons::notes(p, icon_c, 24.0, color),
                 Tab::Loop => icons::loop_arrows(p, icon_c, 24.0, color),
                 Tab::Beats => icons::grid(p, icon_c, 24.0, color),
             }
-            let style = inter(12.0, if active { 600 } else { 500 });
+            let style = inter(
+                if vertical { 11.0 } else { 12.0 },
+                if active { 600 } else { 500 },
+            );
             theme::text(
                 p,
-                pos2(r.center().x, r.bottom() - 6.0),
+                pos2(r.center().x, r.center().y + 20.0),
                 Align2::CENTER_BOTTOM,
                 tab.label(),
                 style,

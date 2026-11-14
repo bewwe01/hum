@@ -250,6 +250,69 @@ impl HumApp {
         }
         y = card.bottom() + GAP;
 
+        // Legato
+        let helper = "One note at a time, gliding between notes. Auto turns it on for wind instruments like the Ocarina.";
+        let helper_h = measure(&clip, helper, w - 2.0 * CARD_PAD);
+        let card = Rect::from_min_size(
+            pos2(x, y),
+            vec2(w, CARD_PAD + 20.0 + 6.0 + helper_h + 12.0 + 48.0 + CARD_PAD),
+        );
+        widgets::surface(&clip, card, 22.0, theme::SURFACE, theme::LINE);
+        let mut cy = card.top() + CARD_PAD;
+        theme::text(
+            &clip,
+            pos2(card.left() + CARD_PAD, cy),
+            Align2::LEFT_TOP,
+            "Legato",
+            inter(16.0, 600),
+            theme::TEXT,
+        );
+        cy += 26.0;
+        widgets::wrapped(
+            &clip,
+            pos2(card.left() + CARD_PAD, cy),
+            w - 2.0 * CARD_PAD,
+            helper,
+            inter(12.0, 400),
+            theme::MUTED,
+        );
+        cy += helper_h + 12.0;
+        let track = Rect::from_min_size(
+            pos2(card.left() + CARD_PAD, cy),
+            vec2(w - 2.0 * CARD_PAD, 48.0),
+        );
+        clip.rect_filled(track, 24.0, theme::SURFACE_2);
+        let seg_w = (track.width() - 8.0) / 3.0;
+        for (i, mode) in crate::state::Legato::ALL.iter().enumerate() {
+            let r = Rect::from_min_size(
+                pos2(track.left() + 4.0 + i as f32 * seg_w, track.top() + 4.0),
+                vec2(seg_w, 40.0),
+            );
+            let tap = self
+                .touches
+                .button(Id::unique(("legato", i)), r.intersect(view));
+            let active = self.st.legato == *mode;
+            if active {
+                clip.rect_filled(r, 20.0, theme::VIOLET);
+            }
+            let (style, color) = if active {
+                (inter(14.0, 600), theme::ON_VIOLET)
+            } else {
+                (inter(14.0, 500), theme::TEXT)
+            };
+            theme::text(
+                &clip,
+                r.center(),
+                Align2::CENTER_CENTER,
+                mode.label(),
+                style,
+                color,
+            );
+            if tap.clicked {
+                self.st.legato = *mode;
+            }
+        }
+        y = card.bottom() + GAP;
         // ABOUT
         y = section_label(&clip, x, y, "ABOUT");
         let promise = "No permissions, no network, no tracking. Everything stays on your phone.";

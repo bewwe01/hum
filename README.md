@@ -5,7 +5,7 @@ sound, play. Notes can be locked to a scale, so nothing sounds wrong.
 
 - **197 sounds:** pianos, keys, guitars, basses, strings, brass and wind,
   choirs, world instruments and 13 drum kits from the bundled GeneralUser
-  GS SoundFont, plus Hum's own 56 synth sounds.
+  GS SoundFont, plus Hum's own 57 synth sounds (including an Ocarina).
 - **Capture looping:** play first, then tap **Loop** and what you just
   played repeats. The first loop sets the length and the tempo. Each
   later tap adds what you played over the loop as a new layer, up to 8.
@@ -14,7 +14,17 @@ sound, play. Notes can be locked to a scale, so nothing sounds wrong.
   and redo, the loop is saved, and you can export it as a WAV file to
   Downloads/Hum.
 - **Four ways to play:** scale-locked keys, piano keys, chord pads and
-  drum pads. Where you touch a key sets how loud it plays.
+  drum pads. Where you touch a key sets how loud it plays. Turn the phone
+  sideways for a wider piano (two octaves or more) and 14 scale keys.
+- **Legato** (Settings): one note at a time with glides between notes.
+  *Auto* turns it on for wind instruments.
+- **Songs:** copy a chord sheet (chords above lyrics, as on tab sites) in
+  your browser and tap **Paste**, or type one. Hum shows the sheet with the
+  current chord highlighted, a strum pad (tap, or swipe down and up), a
+  pad per chord, **Next** to follow the song, key and capo, guitar or
+  piano voicings, and **Auto**, which strums or plays a pattern on the
+  beat. What you play there can be captured as a loop layer. Nothing is
+  downloaded: Hum has no network access.
 - A 16-step beat maker on the same clock.
 
 Hum is a personal Android app for a Pixel (arm64) running GrapheneOS. It
@@ -28,8 +38,8 @@ the small Gradle project and manifest needed to package the APK.
 ```
 crates/
   hum-engine/   pure DSP: oscillators, filters, envelopes, effects, limiter,
-                presets (the 56-sound table), scales, arpeggiator, beat
-                sequencer, looper. No platform code, fully host-testable.
+                presets (the 57-sound table), scales, chords and voicings,
+                arpeggiator, beat sequencer, looper, strums and accompaniment. No platform code, fully host-testable.
   hum-app/      egui UI + cpal audio glue. cdylib for Android, binary for desktop.
   hum-tools/    `render`: renders sounds to .wav and prints measurements.
 android/        minimal NativeActivity Gradle project (no Java/Kotlin code)
@@ -58,7 +68,11 @@ To screenshot every screen without clicking around:
 
 ```sh
 HUM_SHOTS=shots/ cargo run -p hum-app     # writes shots/*.ppm and exits
+HUM_LANDSCAPE=1 cargo run -p hum-app      # an 844x390 (landscape) window
 ```
+
+The desktop build has no clipboard; `HUM_PASTE_FILE=sheet.txt` makes the
+Songs screen's Paste button read that file.
 
 ### Android APK
 
@@ -99,7 +113,7 @@ cargo clippy -p hum-app --features jni-check -- -D warnings
 The engine tests (`crates/hum-engine/tests/engine.rs` plus the unit tests in
 each module) check:
 
-- every one of the 56 sounds renders finite, non-silent audio,
+- every one of the 57 sounds renders finite, non-silent audio,
 - the output never exceeds 0 dBFS, even with every key held on every sound
   with all controls at their extremes (the limiter ceiling is 0.95),
 - note-off always decays to silence and frees its voices (25-second check),
@@ -110,7 +124,11 @@ each module) check:
   133 and 160 BPM,
 - the looper replays recorded notes on the recorded sample, mutes, clears,
   discards empty takes, and keeps each layer's own sound,
-- the arpeggiator walks the scale in time with the shared clock.
+- the arpeggiator walks the scale in time with the shared clock,
+- legato keeps one voice, strums spread their notes in time, and the
+  accompaniment changes chord on the right step,
+- chord symbols parse and voice correctly; chord sheets are read from
+  chords-over-lyrics and ChordPro text.
 
 ## Listen to the sounds
 
@@ -123,7 +141,7 @@ cargo run --release -p hum-tools --bin render -- --all --outdir renders/
 cargo run --release -p hum-tools --bin render -- --list
 ```
 
-`--all` writes `renders/01-laser-lead.wav` … `56-rim-click.wav` and prints
+`--all` writes `renders/01-laser-lead.wav` … `57-ocarina.wav` and prints
 peak, RMS, spectral centroid ("brightness") and tail length for each sound.
 `--x` and `--y` set the XY pad position and `--hold` sets the note length.
 
@@ -177,7 +195,7 @@ construction. Control changes are smoothed every 16 samples.
 counted in sixteenth-note steps from an exact sample position. The engine
 splits each audio block at event boundaries, so events land on exact samples.
 
-**Presets are data.** `crates/hum-engine/src/presets.rs` is one table of 56
+**Presets are data.** `crates/hum-engine/src/presets.rs` is one table of 57
 `Preset` structs. The engine has no per-sound code paths.
 
 **UI.** egui (eframe, OpenGL ES via glow) on `android-activity`'s
@@ -216,6 +234,8 @@ being touched.
   sign is drawn as a vector.
 - **Key and scale pickers** are bottom sheets. The design shows the pills
   but not what happens when you tap them.
+- **Landscape** keeps the keyboard big: the XY pad and the four knobs are
+  only on the upright Play screen.
 - **Narrow phones.** The keyboard fills the leftover height. On short
   screens the XY pad shrinks (minimum 120) before the keyboard drops below
   its minimum of 140.

@@ -12,6 +12,7 @@ mod keyboard;
 mod looping;
 mod platform;
 mod screens;
+mod songs;
 mod state;
 mod theme;
 mod watchdog;
@@ -133,15 +134,20 @@ fn run(
     hooks.audio.borrow_mut().take();
 }
 
-/// Desktop dev mode: a 390x844 window, the mouse acts as a finger.
+/// Desktop dev mode: a 390x844 window (844x390 with `HUM_LANDSCAPE=1`),
+/// the mouse acts as a finger.
 #[cfg(not(target_os = "android"))]
 pub fn desktop_main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Hum")
-            .with_inner_size([390.0, 844.0])
-            .with_min_inner_size([320.0, 600.0]),
+            .with_inner_size(if std::env::var_os("HUM_LANDSCAPE").is_some() {
+                [844.0, 390.0]
+            } else {
+                [390.0, 844.0]
+            })
+            .with_min_inner_size([320.0, 320.0]),
         ..Default::default()
     };
     let event_loop = EventLoop::<eframe::UserEvent>::with_user_event()

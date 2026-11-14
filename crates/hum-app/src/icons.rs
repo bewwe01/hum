@@ -475,3 +475,20 @@ pub fn download(p: &Painter, c: Pos2, size: f32, color: Color32) {
         color,
     );
 }
+
+/// A beamed pair of notes (the Songs tab).
+pub fn notes(p: &Painter, c: Pos2, size: f32, color: Color32) {
+    let s = size / 24.0;
+    let heads = [
+        pos2(c.x - 5.5 * s, c.y + 6.0 * s),
+        pos2(c.x + 6.5 * s, c.y + 4.0 * s),
+    ];
+    for h in heads {
+        p.add(Shape::ellipse_filled(h, vec2(3.6 * s, 2.8 * s), color));
+    }
+    let top_l = pos2(heads[0].x + 3.2 * s, c.y - 8.0 * s);
+    let top_r = pos2(heads[1].x + 3.2 * s, c.y - 10.0 * s);
+    polyline(p, &[pos2(top_l.x, heads[0].y), top_l], W, color);
+    polyline(p, &[pos2(top_r.x, heads[1].y), top_r], W, color);
+    polyline(p, &[top_l, top_r], W * 1.6, color);
+}

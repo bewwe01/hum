@@ -135,6 +135,8 @@ pub struct Voice {
 
     /// 1 while playing normally; ramps to 0 when the voice is being stolen.
     fade: f32,
+    /// Glide time set by a legato move (0 = use the preset's glide).
+    glide_override: f32,
     fading: bool,
     pending: Option<Pending>,
 }
@@ -174,6 +176,7 @@ impl Voice {
             bursts_left: 0,
             next_burst: 0.0,
             fade: 1.0,
+            glide_override: 0.0,
             fading: false,
             pending: None,
         }
@@ -224,6 +227,20 @@ impl Voice {
         }
     }
 
+    /// Legato: move this sounding voice to `note`, gliding over `glide`
+    /// seconds, without restarting its envelopes.
+    pub fn legato(&mut self, note: u8, glide: f32) {
+        let p = self.preset;
+        self.note = note;
+        let key = f32::from(note);
+        self.target_pitch = if p.fixed_note > 0.0 {
+            p.fixed_note + (key - 60.0) * p.fixed_track
+        } else {
+            key
+        };
+        self.glide_override = glide;
+    }
+
     pub fn note_off(&mut self) {
         self.gate = false;
         if self.pending.is_some() {
@@ -255,6 +272,7 @@ impl Voice {
         self.fade = 1.0;
         self.fading = false;
         self.pending = None;
+        self.glide_override = 0.0;
 
         let key = f32::from(p.note);
         self.target_pitch = if preset.fixed_note > 0.0 {
@@ -387,8 +405,9 @@ impl Voice {
         let m = &ctx.macros;
 
         // ---- control-rate work -------------------------------------------
-        if p.glide > 0.0 {
-            self.pitch += (self.target_pitch - self.pitch) * dsp::smooth_coef(p.glide * 0.33, dt);
+        let glide = p.glide.max(self.glide_override);
+        if glide > 0.0 {
+            self.pitch += (self.target_pitch - self.pitch) * dsp::smooth_coef(glide * 0.33, dt);
         } else {
             self.pitch = self.target_pitch;
         }

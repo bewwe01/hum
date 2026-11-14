@@ -118,6 +118,31 @@ pub struct Saved {
     pub looper: Option<Looper>,
     /// How the keyboard area plays (scale keys, piano, chords, drum pads).
     pub play_mode: crate::keyboard::PlayMode,
+    /// One note at a time with glides between notes.
+    pub legato: Legato,
+    /// The song library.
+    pub songs: Vec<crate::songs::Song>,
+}
+
+/// Legato (mono) playing: automatic for wind instruments.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum Legato {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+impl Legato {
+    pub const ALL: [Legato; 3] = [Legato::Auto, Legato::On, Legato::Off];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Legato::Auto => "Auto",
+            Legato::On => "On",
+            Legato::Off => "Off",
+        }
+    }
 }
 
 impl Default for Saved {
@@ -145,6 +170,8 @@ impl Default for Saved {
             keep_screen_on: false,
             looper: None,
             play_mode: crate::keyboard::PlayMode::Scale,
+            legato: Legato::Auto,
+            songs: Vec::new(),
         }
     }
 }
@@ -197,6 +224,10 @@ impl Saved {
             if ![16, 32, 64, 128].contains(&looper.steps) || looper.count() == 0 {
                 self.looper = None;
             }
+        }
+        self.songs.truncate(200);
+        for song in &mut self.songs {
+            song.sanitize();
         }
         self.bpm = if self.bpm.is_finite() {
             self.bpm.clamp(MIN_BPM, MAX_BPM)

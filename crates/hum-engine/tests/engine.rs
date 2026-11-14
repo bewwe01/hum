@@ -87,8 +87,8 @@ fn drain(e: &mut Engine) -> Vec<EngineEvent> {
 }
 
 #[test]
-fn all_56_presets_render_bounded_non_silent_audio() {
-    assert_eq!(PRESETS.len(), 56);
+fn all_presets_render_bounded_non_silent_audio() {
+    assert_eq!(PRESETS.len(), 57);
     for (index, p) in PRESETS.iter().enumerate() {
         let mut e = engine();
         e.handle(Cmd::SetSound(index as u16));
@@ -682,4 +682,97 @@ fn soundfont_instruments_play_and_loop() {
     render(&mut e, 48_000, &mut out);
     assert!(peak(&out) > 0.02, "looped guitar is silent");
     assert_clean(&out, "looped guitar");
+}
+
+#[test]
+fn mono_mode_plays_one_note_and_glides_back() {
+    let mut e = engine();
+    select_dry(&mut e, "Ocarina");
+    e.handle(Cmd::SetMono(true));
+    let mut out = Vec::new();
+    e.handle(Cmd::NoteOn {
+        note: 60,
+        velocity: 100,
+    });
+    render(&mut e, 4_800, &mut out);
+    e.handle(Cmd::NoteOn {
+        note: 64,
+        velocity: 100,
+    });
+    render(&mut e, 4_800, &mut out);
+    assert_eq!(e.active_voices(), 1, "legato keeps one voice");
+    e.handle(Cmd::NoteOff { note: 64 });
+    render(&mut e, 4_800, &mut out);
+    assert_eq!(e.active_voices(), 1, "falls back to the held key");
+    e.handle(Cmd::NoteOff { note: 60 });
+    render(&mut e, 48_000, &mut out);
+    assert_eq!(e.active_voices(), 0);
+    assert_clean(&out, "mono legato");
+}
+
+#[test]
+fn strums_spread_their_notes_in_time() {
+    let mut e = engine();
+    select_dry(&mut e, "Ocarina");
+    let mut notes = [0u8; 8];
+    notes[..4].copy_from_slice(&[48, 52, 55, 60]);
+    e.handle(Cmd::Strum {
+        notes,
+        count: 4,
+        velocity: 100,
+        spread_ms: 10,
+        up: false,
+        ring: false,
+    });
+    let mut out = Vec::new();
+    render(&mut e, 48, &mut out); // 1 ms
+    assert_eq!(e.active_voices(), 1);
+    render(&mut e, 960, &mut out); // 21 ms
+    assert_eq!(e.active_voices(), 3);
+    render(&mut e, 960, &mut out); // 41 ms
+    assert_eq!(e.active_voices(), 4);
+    // A new strum releases the old one before sounding.
+    e.handle(Cmd::Strum {
+        notes,
+        count: 4,
+        velocity: 100,
+        spread_ms: 0,
+        up: true,
+        ring: false,
+    });
+    e.handle(Cmd::StrumRelease);
+    render(&mut e, 48_000, &mut out);
+    assert_eq!(e.active_voices(), 0);
+}
+
+#[test]
+fn accompaniment_follows_chords_on_the_clock() {
+    let mut e = engine();
+    select_dry(&mut e, "Ocarina");
+    e.handle(Cmd::SetBpm(120.0));
+    e.handle(Cmd::AccBegin);
+    for root in [48u8, 53] {
+        let mut notes = [0u8; 8];
+        notes[..3].copy_from_slice(&[root, root + 4, root + 7]);
+        e.handle(Cmd::AccChord {
+            notes,
+            count: 3,
+            steps: 16,
+        });
+    }
+    e.handle(Cmd::AccPattern(3));
+    e.handle(Cmd::AccPlay(true));
+    let mut out = Vec::new();
+    render(&mut e, 4_800, &mut out);
+    assert_eq!(e.shared().status().acc_index, 0);
+    assert!(e.active_voices() >= 3);
+    // 16 sixteenths at 120 BPM = 2 s.
+    render(&mut e, 96_000, &mut out);
+    assert_eq!(e.shared().status().acc_index, 1);
+    render(&mut e, 96_000, &mut out);
+    assert_eq!(e.shared().status().acc_index, 0, "wraps around");
+    e.handle(Cmd::AccPlay(false));
+    render(&mut e, 4_800, &mut out);
+    assert_eq!(e.shared().status().acc_index, -1);
+    assert!(!e.shared().status().running);
 }

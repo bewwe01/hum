@@ -5,7 +5,7 @@ use crate::preset::{
     adsr, arp, ArpPattern, Category, Filter, Lfo, LfoDest, LfoShape, Osc, Preset, Wave,
 };
 
-pub const COUNT: usize = 56;
+pub const COUNT: usize = 57;
 
 const fn sine(level: f32) -> Osc {
     Osc::new(Wave::Sine, level)
@@ -745,6 +745,22 @@ pub static PRESETS: [Preset; COUNT] = [
         gain: 0.97,
         ..DRUM
     },
+    // -------------------------------------------------------------- Wind
+    Preset {
+        name: "Ocarina",
+        category: Category::Wind,
+        // A pure, hollow tone with a breath of noise and a little scoop
+        // into each note; pad Y adds vibrato.
+        osc: [sine(1.0), tri(0.1).oct(1), noise(0.035)],
+        filter: Filter::lp(3200.0, 0.1).track(0.6),
+        amp: adsr(0.045, 0.3, 0.92, 0.14),
+        pitch_env: -0.35,
+        pitch_time: 0.06,
+        lfo: lfo(Sine, 5.3, ToPitch, 0.04, 0.45),
+        reverb: 0.35,
+        gain: 0.41,
+        ..B
+    },
 ];
 
 /// Index of the sound selected on first launch.
@@ -766,8 +782,8 @@ mod tests {
     use crate::preset::Category;
 
     #[test]
-    fn there_are_exactly_56_uniquely_named_sounds() {
-        assert_eq!(PRESETS.len(), 56);
+    fn there_are_exactly_57_uniquely_named_sounds() {
+        assert_eq!(PRESETS.len(), 57);
         for (i, a) in PRESETS.iter().enumerate() {
             assert!(!a.name.is_empty());
             for b in &PRESETS[i + 1..] {
@@ -778,7 +794,9 @@ mod tests {
 
     #[test]
     fn seven_sounds_per_category_in_order() {
-        for (c, cat) in Category::ALL.iter().enumerate() {
+        // The original eight categories hold seven sounds each; the Wind
+        // category (the ocarina) follows them.
+        for (c, cat) in Category::ALL.iter().take(8).enumerate() {
             for i in 0..7 {
                 assert_eq!(
                     PRESETS[c * 7 + i].category,
@@ -799,6 +817,7 @@ mod tests {
         }
         for p in PRESETS.iter() {
             assert_eq!(p.category == Category::Arps, p.arp.is_some(), "{}", p.name);
+            assert!(p.category != Category::Wind || p.name == "Ocarina");
             assert_eq!(p.category == Category::Drums, p.one_shot, "{}", p.name);
             assert!((1..=7).contains(&p.unison), "{}", p.name);
         }

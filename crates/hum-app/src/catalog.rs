@@ -1,4 +1,4 @@
-//! Every playable sound in one list: the 56 synth presets plus the
+//! Every playable sound in one list: Hum's own synth presets plus the
 //! instruments and drum kits of the bundled SoundFont (GeneralUser GS).
 //!
 //! Sounds are saved by a stable key: synth sounds by their name (as in
@@ -89,6 +89,7 @@ fn synth_group(c: Category) -> Group {
         Category::Keys => Group::Keys,
         Category::Drums => Group::Drums,
         Category::Fx => Group::Fx,
+        Category::Wind => Group::Wind,
         Category::Leads | Category::Pads | Category::Arps | Category::Retro => Group::Synth,
     }
 }
@@ -255,13 +256,17 @@ mod tests {
         assert_eq!(gm_group(0, 73), Group::Wind);
         assert_eq!(gm_group(128, 0), Group::Drums);
         let mut c = Catalog::new();
-        assert_eq!(c.items.len(), 56);
+        assert_eq!(c.items.len(), PRESETS.len());
         c.add_soundfont(&[
             (0, 0, "Grand Piano".into()),
             (128, 0, "Standard".into()),
             (8, 4, "Variant".into()),
         ]);
-        assert_eq!(c.items.len(), 58, "only banks 0 and 128 are listed");
+        assert_eq!(
+            c.items.len(),
+            PRESETS.len() + 2,
+            "only banks 0 and 128 are listed"
+        );
         assert_eq!(c.get("gm:0:0").name, "Grand Piano");
         assert_eq!(c.get("gm:0:5").name, "Loading…");
     }

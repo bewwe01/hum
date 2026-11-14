@@ -97,6 +97,21 @@ impl HumApp {
         y += 44.0 + GAP;
 
         // ---- layout ----------------------------------------------------------
+        if self.landscape {
+            // Timeline and layers on the left; transport and keys on the right.
+            let split = rect.left() + rect.width() * 0.56;
+            let left = Rect::from_min_max(pos2(rect.left(), y), pos2(split, rect.bottom()));
+            let right = Rect::from_min_max(pos2(split + GAP, y), rect.max);
+            let timeline = Rect::from_min_size(left.min, vec2(left.width(), 110.0));
+            let list = Rect::from_min_max(pos2(left.left(), timeline.bottom() + 10.0), left.max);
+            let transport = Rect::from_min_size(right.min, vec2(right.width(), 72.0));
+            let keys = Rect::from_min_max(pos2(right.left(), transport.bottom() + 10.0), right.max);
+            self.timeline(&p, timeline);
+            self.layer_list(ui, &p, list);
+            self.loop_transport(&p, transport);
+            self.keyboard(&p, keys, false);
+            return;
+        }
         let keys_h = (rect.height() * 0.15).clamp(80.0, 120.0);
         let transport_h = 72.0;
         let timeline_h = 128.0;

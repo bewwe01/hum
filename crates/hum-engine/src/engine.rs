@@ -34,6 +34,23 @@ pub const fn sf_sound(bank: u16, program: u16) -> SoundId {
     SF_BASE + bank * 128 + program
 }
 
+/// Glide time between legato notes (wind instruments).
+const LEGATO_GLIDE: f32 = 0.07;
+/// Chords the accompaniment can hold.
+pub const ACC_CHORDS: usize = 256;
+/// Notes in one strummed chord.
+pub const STRUM_NOTES: usize = 8;
+/// Accompaniment patterns (index for [`Cmd::AccPattern`]).
+pub const ACC_PATTERNS: [&str; 7] = [
+    "Down",
+    "Down-up",
+    "Folk",
+    "Piano",
+    "Piano 8ths",
+    "Arpeggio",
+    "Ballad",
+];
+
 /// SoundFont output level relative to the synth voices.
 const SF_GAIN: f32 = 7.0;
 /// MIDI channels used for SoundFont parts: the live part and 8 layers.
@@ -52,7 +69,8 @@ const PHRASE_GAP_SECONDS: f64 = 3.0;
 const TARGET_BPM: f64 = 110.0;
 const NO_LOOP_STEPS: u32 = LOOP_STEPS as u32;
 /// On-screen keys, plus one virtual key used for previews.
-pub const KEYS: usize = 7;
+/// On-screen scale keys (two octaves in landscape).
+pub const KEYS: usize = 14;
 const PREVIEW_KEY: usize = KEYS;
 const KEY_SLOTS: usize = KEYS + 1;
 
@@ -147,6 +165,8 @@ pub struct Status {
     pub pos: f32,
     /// Current step, or -1 when stopped.
     pub step: i32,
+    /// Accompaniment: index of the chord playing, or -1 when off.
+    pub acc_index: i32,
     pub active_voices: u32,
 }
 
@@ -165,6 +185,7 @@ pub struct Shared {
     loop_steps: AtomicU32,
     pos: AtomicF32,
     step: AtomicI32,
+    acc: AtomicI32,
     voices: AtomicU32,
 }
 
@@ -181,6 +202,7 @@ impl Default for Shared {
             loop_steps: AtomicU32::new(NO_LOOP_STEPS),
             pos: AtomicF32::new(0.0),
             step: AtomicI32::new(-1),
+            acc: AtomicI32::new(-1),
             voices: AtomicU32::new(0),
         }
     }
@@ -200,6 +222,7 @@ impl Shared {
             loop_steps: self.loop_steps.load(Ordering::Relaxed),
             pos: self.pos.get(),
             step: self.step.load(Ordering::Relaxed),
+            acc_index: self.acc.load(Ordering::Relaxed),
             active_voices: self.voices.load(Ordering::Relaxed),
         }
     }
@@ -292,6 +315,34 @@ pub enum Cmd {
         muted: bool,
     },
     ClearAll,
+    /// One note at a time with legato glides (wind instruments).
+    SetMono(bool),
+    /// Strum (or block) a chord with the live sound: notes low to high,
+    /// played `spread_ms` apart (upwards strums go high to low). Unless
+    /// `ring`, the previous strum is released first.
+    Strum {
+        notes: [u8; STRUM_NOTES],
+        count: u8,
+        velocity: u8,
+        spread_ms: u8,
+        up: bool,
+        ring: bool,
+    },
+    /// Release the notes of the last strum.
+    StrumRelease,
+    /// Replace the accompaniment's chord list: AccBegin, AccChord..., in
+    /// song order; each chord lasts `steps` sixteenths.
+    AccBegin,
+    AccChord {
+        notes: [u8; STRUM_NOTES],
+        count: u8,
+        steps: u16,
+    },
+    /// Pattern index into [`ACC_PATTERNS`].
+    AccPattern(u8),
+    AccPlay(bool),
+    /// Continue the accompaniment from chord `index`.
+    AccJump(u16),
 }
 
 /// Why a capture did not produce a layer.
@@ -410,6 +461,14 @@ impl Layer {
 
 const NEVER: u64 = u64::MAX;
 
+/// One chord of the accompaniment.
+#[derive(Clone, Copy, Debug, Default)]
+struct AccChord {
+    notes: [u8; STRUM_NOTES],
+    count: u8,
+    steps: u16,
+}
+
 struct ArpState {
     held: [bool; KEY_SLOTS],
     velocity: u8,
@@ -460,6 +519,27 @@ pub struct Engine {
     macros: [Macros; PARTS],
     last_pitch: [f32; PARTS],
     arp: ArpState,
+
+    mono: bool,
+    mono_stack: [u8; 16],
+    mono_len: usize,
+    mono_current: Option<u8>,
+    mono_velocity: u8,
+
+    /// Strum notes waiting to sound: (samples to wait, note, velocity).
+    strum_pending: [(u64, u8, u8); STRUM_NOTES],
+    strum_pending_len: usize,
+    strum_sounding: [u8; 16],
+    strum_sounding_len: usize,
+
+    acc_chords: Box<[AccChord]>,
+    acc_len: usize,
+    acc_on: bool,
+    acc_index: usize,
+    /// Steps left in the current chord.
+    acc_left: u32,
+    acc_pattern: u8,
+    acc_arp: usize,
     preview_off: u64,
 
     transport: Transport,
@@ -532,6 +612,22 @@ impl Engine {
             macros: [Macros::NEUTRAL; PARTS],
             last_pitch: [60.0; PARTS],
             arp: ArpState::new(),
+            mono: false,
+            mono_stack: [0; 16],
+            mono_len: 0,
+            mono_current: None,
+            mono_velocity: 100,
+            strum_pending: [(0, 0, 0); STRUM_NOTES],
+            strum_pending_len: 0,
+            strum_sounding: [0; 16],
+            strum_sounding_len: 0,
+            acc_chords: vec![AccChord::default(); ACC_CHORDS].into_boxed_slice(),
+            acc_len: 0,
+            acc_on: false,
+            acc_index: 0,
+            acc_left: 0,
+            acc_pattern: 0,
+            acc_arp: 0,
             preview_off: NEVER,
             transport: Transport::new(sample_rate),
             next_step: 0,
@@ -806,6 +902,70 @@ impl Engine {
                     }
                 }
             }
+            Cmd::SetMono(on) => {
+                if on != self.mono {
+                    self.release_live();
+                    self.mono = on;
+                }
+            }
+            Cmd::Strum {
+                notes,
+                count,
+                velocity,
+                spread_ms,
+                up,
+                ring,
+            } => {
+                self.strum(
+                    &notes[..usize::from(count).min(STRUM_NOTES)],
+                    velocity,
+                    spread_ms,
+                    up,
+                    ring,
+                );
+            }
+            Cmd::StrumRelease => self.strum_release(),
+            Cmd::AccBegin => {
+                self.acc_len = 0;
+                self.acc_index = 0;
+                self.acc_left = 0;
+            }
+            Cmd::AccChord {
+                notes,
+                count,
+                steps,
+            } => {
+                if self.acc_len < ACC_CHORDS {
+                    self.acc_chords[self.acc_len] = AccChord {
+                        notes,
+                        count: count.min(STRUM_NOTES as u8),
+                        steps: steps.max(1),
+                    };
+                    self.acc_len += 1;
+                }
+            }
+            Cmd::AccPattern(p) => self.acc_pattern = p.min(ACC_PATTERNS.len() as u8 - 1),
+            Cmd::AccPlay(on) => {
+                if on && self.acc_len > 0 {
+                    self.acc_on = true;
+                    self.acc_index = self.acc_index.min(self.acc_len - 1);
+                    self.acc_left = u32::from(self.acc_chords[self.acc_index].steps);
+                    self.acc_arp = 0;
+                    self.ensure_running();
+                } else {
+                    self.acc_on = false;
+                    self.strum_release();
+                    self.maybe_stop();
+                }
+            }
+            Cmd::AccJump(index) => {
+                if self.acc_len > 0 {
+                    self.acc_index = usize::from(index).min(self.acc_len - 1);
+                    self.acc_left = u32::from(self.acc_chords[self.acc_index].steps);
+                    self.acc_arp = 0;
+                    self.strum_release();
+                }
+            }
             Cmd::ClearAll => {
                 for i in 0..LAYERS {
                     self.clear_layer(i);
@@ -852,7 +1012,7 @@ impl Engine {
         if !self.layers.iter().any(|l| l.active) {
             self.loop_on = false;
         }
-        if !self.beat_on && !self.loop_on && self.transport.running {
+        if !self.beat_on && !self.loop_on && !self.acc_on && self.transport.running {
             self.transport.stop();
             self.next_step = 0;
             for i in 0..LAYERS {
@@ -917,18 +1077,234 @@ impl Engine {
         if let Some(note) = self.arp.note.take() {
             self.live_off(note);
         }
+        self.strum_release();
+        self.mono_len = 0;
+        self.mono_current = None;
         self.release_part(PART_LIVE);
         self.preview_off = NEVER;
     }
 
     fn live_on(&mut self, note: u8, velocity: u8) {
-        self.note_on(PART_LIVE, self.live_sound, note, velocity);
-        self.remember(note, velocity);
+        if !self.mono {
+            self.note_on(PART_LIVE, self.live_sound, note, velocity);
+            self.remember(note, velocity);
+            return;
+        }
+        // One note at a time; the newest held key wins.
+        if let Some(i) = self.mono_stack[..self.mono_len]
+            .iter()
+            .position(|&n| n == note)
+        {
+            self.mono_stack.copy_within(i + 1..self.mono_len, i);
+            self.mono_len -= 1;
+        }
+        if self.mono_len == self.mono_stack.len() {
+            self.mono_stack.copy_within(1.., 0);
+            self.mono_len -= 1;
+        }
+        self.mono_stack[self.mono_len] = note;
+        self.mono_len += 1;
+        self.mono_velocity = velocity;
+        match self.mono_current {
+            Some(current) if current != note => self.mono_move(current, note),
+            Some(_) => {}
+            None => {
+                self.note_on(PART_LIVE, self.live_sound, note, velocity);
+                self.remember(note, velocity);
+            }
+        }
+        self.mono_current = Some(note);
     }
 
     fn live_off(&mut self, note: u8) {
-        self.note_off(PART_LIVE, note);
-        self.remember(note, 0);
+        if !self.mono {
+            self.note_off(PART_LIVE, note);
+            self.remember(note, 0);
+            return;
+        }
+        if let Some(i) = self.mono_stack[..self.mono_len]
+            .iter()
+            .position(|&n| n == note)
+        {
+            self.mono_stack.copy_within(i + 1..self.mono_len, i);
+            self.mono_len -= 1;
+        }
+        if self.mono_current != Some(note) {
+            return;
+        }
+        if self.mono_len > 0 {
+            // Fall back to the key still held (legato).
+            let previous = self.mono_stack[self.mono_len - 1];
+            self.mono_move(note, previous);
+            self.mono_current = Some(previous);
+        } else {
+            self.note_off(PART_LIVE, note);
+            self.remember(note, 0);
+            self.mono_current = None;
+        }
+    }
+
+    /// Move the sounding mono note from `from` to `to`: a gliding legato for
+    /// synth sounds, a clean hand-over for SoundFont sounds.
+    fn mono_move(&mut self, from: u8, to: u8) {
+        self.remember(from, 0);
+        self.remember(to, self.mono_velocity);
+        if self.live_sound < SF_BASE {
+            if let Some(v) = self
+                .voices
+                .iter_mut()
+                .find(|v| v.active && v.gate && v.part == PART_LIVE && v.note == from)
+            {
+                v.legato(to, LEGATO_GLIDE);
+                return;
+            }
+        }
+        self.note_off(PART_LIVE, from);
+        self.note_on(PART_LIVE, self.live_sound, to, self.mono_velocity);
+    }
+
+    // ------------------------------------------------------------------
+    // Strums and accompaniment
+
+    fn strum(&mut self, notes: &[u8], velocity: u8, spread_ms: u8, up: bool, ring: bool) {
+        if !ring {
+            self.strum_release();
+        }
+        let spread = (f32::from(spread_ms) * 0.001 * self.sample_rate) as u64;
+        let count = notes.len();
+        for k in 0..count {
+            let note = if up { notes[count - 1 - k] } else { notes[k] };
+            // Later strings are a little softer; up-strums softer overall.
+            let taper = 1.0 - 0.05 * k as f32;
+            let base = if up {
+                f32::from(velocity) * 0.85
+            } else {
+                f32::from(velocity)
+            };
+            let vel = (base * taper).clamp(1.0, 127.0) as u8;
+            if self.strum_pending_len < STRUM_NOTES {
+                self.strum_pending[self.strum_pending_len] = (k as u64 * spread, note, vel);
+                self.strum_pending_len += 1;
+            }
+        }
+    }
+
+    fn strum_release(&mut self) {
+        self.strum_pending_len = 0;
+        for i in 0..self.strum_sounding_len {
+            let note = self.strum_sounding[i];
+            self.note_off(PART_LIVE, note);
+            self.remember(note, 0);
+        }
+        self.strum_sounding_len = 0;
+    }
+
+    /// Sound the strum notes that are due now.
+    fn strum_due(&mut self) {
+        let mut i = 0;
+        while i < self.strum_pending_len {
+            let (wait, note, vel) = self.strum_pending[i];
+            if wait > 0 {
+                i += 1;
+                continue;
+            }
+            self.strum_pending
+                .copy_within(i + 1..self.strum_pending_len, i);
+            self.strum_pending_len -= 1;
+            if let Some(j) = self.strum_sounding[..self.strum_sounding_len]
+                .iter()
+                .position(|&n| n == note)
+            {
+                // Re-striking a ringing string.
+                self.note_off(PART_LIVE, note);
+                self.remember(note, 0);
+                self.strum_sounding
+                    .copy_within(j + 1..self.strum_sounding_len, j);
+                self.strum_sounding_len -= 1;
+            }
+            if self.strum_sounding_len == self.strum_sounding.len() {
+                let oldest = self.strum_sounding[0];
+                self.note_off(PART_LIVE, oldest);
+                self.remember(oldest, 0);
+                self.strum_sounding.copy_within(1.., 0);
+                self.strum_sounding_len -= 1;
+            }
+            self.note_on(PART_LIVE, self.live_sound, note, vel);
+            self.remember(note, vel);
+            self.strum_sounding[self.strum_sounding_len] = note;
+            self.strum_sounding_len += 1;
+        }
+    }
+
+    /// One accompaniment step (a sixteenth) on the shared clock.
+    fn acc_step(&mut self) {
+        if self.acc_len == 0 {
+            return;
+        }
+        if self.acc_left == 0 {
+            self.acc_index = (self.acc_index + 1) % self.acc_len;
+            self.acc_left = u32::from(self.acc_chords[self.acc_index].steps);
+            self.acc_arp = 0;
+            self.strum_release();
+        }
+        let chord = self.acc_chords[self.acc_index];
+        let pos = (u32::from(chord.steps) - self.acc_left) % 16;
+        self.acc_left -= 1;
+        let n = usize::from(chord.count);
+        if n == 0 {
+            return;
+        }
+        let notes = &chord.notes[..n];
+        let accent = if pos == 0 { 112 } else { 96 };
+        // Patterns: 0 Down, 1 Down-up, 2 Folk, 3 Piano, 4 Piano 8ths,
+        // 5 Arpeggio, 6 Ballad.
+        let down = |p: u32| matches!(p, 0 | 4 | 8 | 12);
+        let (strum_down, strum_up, block, arp, bass) = match self.acc_pattern {
+            0 => (down(pos), false, false, false, false),
+            1 => (
+                down(pos),
+                matches!(pos, 2 | 6 | 10 | 14),
+                false,
+                false,
+                false,
+            ),
+            2 => (
+                matches!(pos, 0 | 4 | 12),
+                matches!(pos, 6 | 10 | 14),
+                false,
+                false,
+                false,
+            ),
+            3 => (false, false, pos == 0 || pos == 8, false, false),
+            4 => (false, false, pos.is_multiple_of(2), false, false),
+            5 => (false, false, false, pos.is_multiple_of(2), false),
+            _ => (
+                false,
+                false,
+                false,
+                pos.is_multiple_of(2) && !pos.is_multiple_of(8),
+                pos.is_multiple_of(8),
+            ),
+        };
+        if strum_down {
+            self.strum(notes, accent, 14, false, false);
+        } else if strum_up {
+            let top = &notes[n.saturating_sub(4)..];
+            self.strum(top, 80, 10, true, false);
+        } else if block {
+            self.strum(notes, accent - 8, 3, false, false);
+        } else if bass {
+            self.strum(&notes[..1], accent, 0, false, true);
+        } else if arp {
+            let pool = if self.acc_pattern == 6 && n > 1 {
+                &notes[1..]
+            } else {
+                notes
+            };
+            let note = pool[self.acc_arp % pool.len()];
+            self.acc_arp += 1;
+            self.strum(&[note], 90, 0, false, true);
+        }
     }
 
     /// Unwrapped transport position in steps.
@@ -1386,6 +1762,9 @@ impl Engine {
                 }
             }
         }
+        if step >= 0 && self.acc_on {
+            self.acc_step();
+        }
         if self.metronome && in_bar.is_multiple_of(4) {
             let accent = in_bar == 0;
             self.click_inc = if accent { 1568.0 } else { 1046.5 } / self.sample_rate;
@@ -1446,11 +1825,15 @@ impl Engine {
         if self.arp.next == 0 {
             self.arp_step();
         }
+        self.strum_due();
     }
 
     /// Samples until the next scheduled event (at least 1).
     fn next_event_distance(&self) -> u64 {
         let mut d = self.preview_off.min(self.arp.next).min(self.arp.off);
+        for &(wait, _, _) in &self.strum_pending[..self.strum_pending_len] {
+            d = d.min(wait);
+        }
         if self.transport.running {
             d = d.min(self.transport.samples_until(f64::from(self.loop_steps)));
             d = d.min(self.transport.samples_until(self.next_step as f64));
@@ -1472,6 +1855,9 @@ impl Engine {
             if *t != NEVER {
                 *t = t.saturating_sub(n64);
             }
+        }
+        for p in self.strum_pending[..self.strum_pending_len].iter_mut() {
+            p.0 = p.0.saturating_sub(n64);
         }
         self.now += n64;
         if self.transport.running {
@@ -1596,6 +1982,12 @@ impl Engine {
         if !self.transport.running {
             s.step.store(-1, Ordering::Relaxed);
         }
+        let acc = if self.acc_on {
+            self.acc_index as i32
+        } else {
+            -1
+        };
+        s.acc.store(acc, Ordering::Relaxed);
         s.voices
             .store(self.active_voices() as u32, Ordering::Relaxed);
     }

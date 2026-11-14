@@ -14,6 +14,10 @@ const DOUBLE_TAP_SECONDS: f64 = 0.35;
 
 impl HumApp {
     pub(crate) fn play_screen(&mut self, ui: &mut egui::Ui, rect: Rect) {
+        if self.landscape {
+            self.play_landscape(ui, rect);
+            return;
+        }
         let p = ui.painter().clone();
         let mut y = rect.top();
 
@@ -21,6 +25,62 @@ impl HumApp {
         let settings = Rect::from_min_size(pos2(rect.right() - 56.0, y), vec2(56.0, 56.0));
         let picker =
             Rect::from_min_max(pos2(rect.left(), y), pos2(settings.left() - 10.0, y + 56.0));
+        self.sound_picker(&p, picker);
+        self.settings_button(&p, settings);
+        y += 56.0 + GAP;
+
+        // ---- scale row -----------------------------------------------------
+        self.scale_row(
+            &p,
+            Rect::from_min_size(pos2(rect.left(), y), vec2(rect.width(), 44.0)),
+        );
+        y += 44.0 + GAP;
+
+        // ---- vertical budget ----------------------------------------------
+        let knobs_h = 64.0 + 8.0 + 14.0;
+        let loop_h = 64.0;
+        let keys_min = 44.0 + 8.0 + 140.0;
+        let pad_h =
+            (rect.bottom() - y - GAP - knobs_h - GAP - loop_h - GAP - keys_min).clamp(110.0, 232.0);
+
+        // ---- XY pad --------------------------------------------------------
+        self.xy_pad(
+            &p,
+            Rect::from_min_size(pos2(rect.left(), y), vec2(rect.width(), pad_h)),
+        );
+        y += pad_h + GAP;
+
+        // ---- knobs ---------------------------------------------------------
+        self.knob_row(
+            &p,
+            Rect::from_min_size(pos2(rect.left(), y), vec2(rect.width(), knobs_h)),
+        );
+        y += knobs_h + GAP;
+
+        // ---- loop bar --------------------------------------------------------
+        self.loop_bar(
+            &p,
+            Rect::from_min_size(pos2(rect.left(), y), vec2(rect.width(), loop_h)),
+        );
+        y += loop_h + GAP;
+
+        // ---- keyboard block ------------------------------------------------
+        // Mode switch (Scale / Piano / Chords / Drums) and, except for drum
+        // pads, the octave stepper.
+        let switch_right = if self.st.play_mode == crate::keyboard::PlayMode::Drums {
+            rect.right()
+        } else {
+            self.octave_stepper(&p, rect.right(), y + 22.0).left() - 10.0
+        };
+        let switch = Rect::from_min_max(pos2(rect.left(), y + 2.0), pos2(switch_right, y + 42.0));
+        self.mode_switch(&p, switch);
+        y += 44.0 + 8.0;
+        let keys = Rect::from_min_max(pos2(rect.left(), y), rect.max);
+        self.keyboard(&p, keys, true);
+    }
+
+    fn sound_picker(&mut self, p: &egui::Painter, picker: Rect) {
+        let p = p.clone();
         let tap = self.touches.button(Id::unique("picker"), picker);
         widgets::surface(
             &p,
@@ -78,7 +138,10 @@ impl HumApp {
         if tap.clicked {
             self.tab = Tab::Sounds;
         }
+    }
 
+    fn settings_button(&mut self, p: &egui::Painter, settings: Rect) {
+        let p = p.clone();
         let tap = self.touches.button(Id::unique("settings"), settings);
         widgets::surface(
             &p,
@@ -91,55 +154,42 @@ impl HumApp {
         if tap.clicked {
             self.settings_open = true;
         }
-        y += 56.0 + GAP;
+    }
 
-        // ---- scale row -----------------------------------------------------
+    /// Landscape: the controls in two short rows, then a wide keyboard.
+    fn play_landscape(&mut self, ui: &mut egui::Ui, rect: Rect) {
+        let p = ui.painter().clone();
+        let row_h = 48.0;
+        let settings =
+            Rect::from_min_size(pos2(rect.right() - row_h, rect.top()), vec2(row_h, row_h));
+        let picker_w = (rect.width() * 0.34).clamp(200.0, 320.0);
+        let picker = Rect::from_min_size(rect.min, vec2(picker_w, row_h));
+        self.sound_picker(&p, picker);
+        self.settings_button(&p, settings);
         self.scale_row(
             &p,
-            Rect::from_min_size(pos2(rect.left(), y), vec2(rect.width(), 44.0)),
+            Rect::from_min_max(
+                pos2(picker.right() + 10.0, rect.top() + 2.0),
+                pos2(settings.left() - 10.0, rect.top() + 46.0),
+            ),
         );
-        y += 44.0 + GAP;
-
-        // ---- vertical budget ----------------------------------------------
-        let knobs_h = 64.0 + 8.0 + 14.0;
-        let loop_h = 64.0;
-        let keys_min = 44.0 + 8.0 + 140.0;
-        let pad_h =
-            (rect.bottom() - y - GAP - knobs_h - GAP - loop_h - GAP - keys_min).clamp(110.0, 232.0);
-
-        // ---- XY pad --------------------------------------------------------
-        self.xy_pad(
-            &p,
-            Rect::from_min_size(pos2(rect.left(), y), vec2(rect.width(), pad_h)),
-        );
-        y += pad_h + GAP;
-
-        // ---- knobs ---------------------------------------------------------
-        self.knob_row(
-            &p,
-            Rect::from_min_size(pos2(rect.left(), y), vec2(rect.width(), knobs_h)),
-        );
-        y += knobs_h + GAP;
-
-        // ---- loop bar --------------------------------------------------------
+        let y = rect.top() + row_h + 10.0;
+        let loop_w = (rect.width() * 0.34).clamp(240.0, 320.0);
         self.loop_bar(
             &p,
-            Rect::from_min_size(pos2(rect.left(), y), vec2(rect.width(), loop_h)),
+            Rect::from_min_size(pos2(rect.left(), y), vec2(loop_w, 52.0)),
         );
-        y += loop_h + GAP;
-
-        // ---- keyboard block ------------------------------------------------
-        // Mode switch (Scale / Piano / Chords / Drums) and, except for drum
-        // pads, the octave stepper.
         let switch_right = if self.st.play_mode == crate::keyboard::PlayMode::Drums {
             rect.right()
         } else {
-            self.octave_stepper(&p, rect.right(), y + 22.0).left() - 10.0
+            self.octave_stepper(&p, rect.right(), y + 26.0).left() - 10.0
         };
-        let switch = Rect::from_min_max(pos2(rect.left(), y + 2.0), pos2(switch_right, y + 42.0));
+        let switch = Rect::from_min_max(
+            pos2(rect.left() + loop_w + 10.0, y + 6.0),
+            pos2(switch_right, y + 46.0),
+        );
         self.mode_switch(&p, switch);
-        y += 44.0 + 8.0;
-        let keys = Rect::from_min_max(pos2(rect.left(), y), rect.max);
+        let keys = Rect::from_min_max(pos2(rect.left(), y + 52.0 + 10.0), rect.max);
         self.keyboard(&p, keys, true);
     }
 
