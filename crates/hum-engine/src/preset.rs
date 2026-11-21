@@ -1,5 +1,5 @@
 //! Preset data model. A sound is plain data: the engine has no per-sound
-//! code paths. The 56 built-in sounds live in [`crate::presets`].
+//! code paths. The built-in sounds live in [`crate::presets`].
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Category {
@@ -12,10 +12,11 @@ pub enum Category {
     Retro,
     Drums,
     Wind,
+    Crystal,
 }
 
 impl Category {
-    pub const ALL: [Category; 9] = [
+    pub const ALL: [Category; 10] = [
         Category::Leads,
         Category::Pads,
         Category::Bass,
@@ -25,6 +26,7 @@ impl Category {
         Category::Retro,
         Category::Drums,
         Category::Wind,
+        Category::Crystal,
     ];
 
     pub fn name(self) -> &'static str {
@@ -38,6 +40,7 @@ impl Category {
             Category::Retro => "Retro",
             Category::Drums => "Drums",
             Category::Wind => "Wind",
+            Category::Crystal => "Crystal",
         }
     }
 }

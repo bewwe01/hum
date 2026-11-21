@@ -3,9 +3,19 @@
 A synth and instrument playground for complete beginners. Open it, pick a
 sound, play. Notes can be locked to a scale, so nothing sounds wrong.
 
-- **197 sounds:** pianos, keys, guitars, basses, strings, brass and wind,
+- **214 sounds:** pianos, keys, guitars, basses, strings, brass and wind,
   choirs, world instruments and 13 drum kits from the bundled GeneralUser
-  GS SoundFont, plus Hum's own 57 synth sounds (including an Ocarina).
+  GS SoundFont, plus Hum's own 73 synth sounds: an Ocarina, the **Crystal**
+  pack (12 eerie, broken, euphoric sounds in the witch house mood) and an
+  808 drum kit.
+- **Haze:** effects on the whole mix: Distortion, Crush (8-bit), Tape
+  (wobble, hiss, crackle), Shimmer (a huge reverb that climbs an octave)
+  and Pump (the mix ducks on every beat). *Haunted* sets them all at once.
+  Exports include them.
+- **Drag, Stutter, Tape stop:** buttons on the Play screen. Drag takes
+  everything, loops included, down 3 semitones at 80 % speed (or 5 at
+  70 %). Hold Stutter to repeat the last 1/8 or 1/16 note; hold Tape stop
+  to wind the music down like a stopping tape.
 - **Capture looping:** play first, then tap **Loop** and what you just
   played repeats. The first loop sets the length and the tempo. Each
   later tap adds what you played over the loop as a new layer, up to 8.
@@ -18,14 +28,9 @@ sound, play. Notes can be locked to a scale, so nothing sounds wrong.
   sideways for a wider piano (two octaves or more) and 14 scale keys.
 - **Legato** (Settings): one note at a time with glides between notes.
   *Auto* turns it on for wind instruments.
-- **Songs:** copy a chord sheet (chords above lyrics, as on tab sites) in
-  your browser and tap **Paste**, or type one. Hum shows the sheet with the
-  current chord highlighted, a strum pad (tap, or swipe down and up), a
-  pad per chord, **Next** to follow the song, key and capo, guitar or
-  piano voicings, and **Auto**, which strums or plays a pattern on the
-  beat. What you play there can be captured as a loop layer. Nothing is
-  downloaded: Hum has no network access.
-- A 16-step beat maker on the same clock.
+- A 16-step beat maker on the same clock, with a classic or 808 kit,
+  triplet rolls, half-time, swing and three starter beats (Witch, Drag,
+  Rave).
 
 Hum is a personal Android app for a Pixel (arm64) running GrapheneOS. It
 **requests zero permissions**, has no network code and no analytics, and
@@ -38,8 +43,8 @@ the small Gradle project and manifest needed to package the APK.
 ```
 crates/
   hum-engine/   pure DSP: oscillators, filters, envelopes, effects, limiter,
-                presets (the 57-sound table), scales, chords and voicings,
-                arpeggiator, beat sequencer, looper, strums and accompaniment. No platform code, fully host-testable.
+                presets (the 73-sound table), scales, arpeggiator, beat
+                sequencer, looper, Haze effects, drag, stutter, tape stop. No platform code, fully host-testable.
   hum-app/      egui UI + cpal audio glue. cdylib for Android, binary for desktop.
   hum-tools/    `render`: renders sounds to .wav and prints measurements.
 android/        minimal NativeActivity Gradle project (no Java/Kotlin code)
@@ -70,9 +75,6 @@ To screenshot every screen without clicking around:
 HUM_SHOTS=shots/ cargo run -p hum-app     # writes shots/*.ppm and exits
 HUM_LANDSCAPE=1 cargo run -p hum-app      # an 844x390 (landscape) window
 ```
-
-The desktop build has no clipboard; `HUM_PASTE_FILE=sheet.txt` makes the
-Songs screen's Paste button read that file.
 
 ### Android APK
 
@@ -113,7 +115,7 @@ cargo clippy -p hum-app --features jni-check -- -D warnings
 The engine tests (`crates/hum-engine/tests/engine.rs` plus the unit tests in
 each module) check:
 
-- every one of the 57 sounds renders finite, non-silent audio,
+- every one of the 73 sounds renders finite, non-silent audio,
 - the output never exceeds 0 dBFS, even with every key held on every sound
   with all controls at their extremes (the limiter ceiling is 0.95),
 - note-off always decays to silence and frees its voices (25-second check),
@@ -125,10 +127,11 @@ each module) check:
 - the looper replays recorded notes on the recorded sample, mutes, clears,
   discards empty takes, and keeps each layer's own sound,
 - the arpeggiator walks the scale in time with the shared clock,
-- legato keeps one voice, strums spread their notes in time, and the
-  accompaniment changes chord on the right step,
-- chord symbols parse and voice correctly; chord sheets are read from
-  chords-over-lyrics and ChordPro text.
+- legato keeps one voice,
+- half-time, swing and triplet rolls put drum hits on the right sample,
+- Drag lowers pitch by the right amount and keeps the user's tempo,
+- every Haze effect at full stays below 0 dBFS and the shimmer's feedback
+  dies away, Stutter repeats its slice exactly and Tape stop ends silent.
 
 ## Listen to the sounds
 
@@ -141,7 +144,7 @@ cargo run --release -p hum-tools --bin render -- --all --outdir renders/
 cargo run --release -p hum-tools --bin render -- --list
 ```
 
-`--all` writes `renders/01-laser-lead.wav` … `57-ocarina.wav` and prints
+`--all` writes `renders/01-laser-lead.wav` … `73-haze-clap.wav` and prints
 peak, RMS, spectral centroid ("brightness") and tail length for each sound.
 `--x` and `--y` set the XY pad position and `--hold` sets the note length.
 
@@ -187,7 +190,9 @@ up to 7 unison voices, a sub, 2-op FM, ring mod, a state-variable filter
 (LP/BP/HP, 24 dB cascade, formant mode) with key tracking and an envelope,
 amp, filter and pitch envelopes, one LFO (tempo-sync option), glide, drive and
 a bit-crusher. Shared bus: chorus, tempo-aware ping-pong delay,
-Freeverb-style reverb (the REVERB knob is the send), then a soft limiter with
+Freeverb-style reverb (the REVERB knob is the send), then Haze (drive,
+crush, tape, shimmer in the reverb's feedback, pump), stutter / tape stop
+from a 2-second history of the mix, a bus compressor and a soft limiter with
 an instant-attack peak follower, which bounds the output below 0 dBFS by
 construction. Control changes are smoothed every 16 samples.
 
@@ -195,7 +200,7 @@ construction. Control changes are smoothed every 16 samples.
 counted in sixteenth-note steps from an exact sample position. The engine
 splits each audio block at event boundaries, so events land on exact samples.
 
-**Presets are data.** `crates/hum-engine/src/presets.rs` is one table of 57
+**Presets are data.** `crates/hum-engine/src/presets.rs` is one table of 73
 `Preset` structs. The engine has no per-sound code paths.
 
 **UI.** egui (eframe, OpenGL ES via glow) on `android-activity`'s

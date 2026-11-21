@@ -17,13 +17,14 @@ pub enum Group {
     Strings,
     Wind,
     Synth,
+    Crystal,
     Drums,
     World,
     Fx,
 }
 
 impl Group {
-    pub const ALL: [Group; 10] = [
+    pub const ALL: [Group; 11] = [
         Group::Piano,
         Group::Keys,
         Group::Guitar,
@@ -31,6 +32,7 @@ impl Group {
         Group::Strings,
         Group::Wind,
         Group::Synth,
+        Group::Crystal,
         Group::Drums,
         Group::World,
         Group::Fx,
@@ -45,6 +47,7 @@ impl Group {
             Group::Strings => "Strings",
             Group::Wind => "Wind",
             Group::Synth => "Synth",
+            Group::Crystal => "Crystal",
             Group::Drums => "Drums",
             Group::World => "World",
             Group::Fx => "FX",
@@ -57,7 +60,7 @@ impl Group {
             Group::Piano | Group::Keys => Wave::Triangle,
             Group::Guitar | Group::Strings | Group::Synth => Wave::Saw,
             Group::Bass | Group::Wind => Wave::Sine,
-            Group::World => Wave::Square,
+            Group::World | Group::Crystal => Wave::Square,
             Group::Drums | Group::Fx => Wave::Noise,
         }
     }
@@ -90,6 +93,7 @@ fn synth_group(c: Category) -> Group {
         Category::Drums => Group::Drums,
         Category::Fx => Group::Fx,
         Category::Wind => Group::Wind,
+        Category::Crystal => Group::Crystal,
         Category::Leads | Category::Pads | Category::Arps | Category::Retro => Group::Synth,
     }
 }

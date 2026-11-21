@@ -19,6 +19,173 @@ impl HumApp {
         });
     }
 
+    fn set_rolls(&mut self, drum: usize, bits: u16) {
+        self.st.rolls[drum] = bits;
+        self.send(Cmd::SetRolls {
+            drum: drum as u8,
+            bits,
+        });
+    }
+
+    fn apply_style(&mut self, style: &hum_engine::transport::BeatStyle) {
+        for drum in 0..4 {
+            self.set_pattern(drum, style.patterns[drum]);
+            self.set_rolls(drum, style.rolls[drum]);
+        }
+        self.st.kit = style.kit;
+        self.send(Cmd::SetKit(style.kit));
+        self.st.half_time = style.half_time;
+        self.send(Cmd::HalfTime(style.half_time));
+        self.st.swing = style.swing;
+        self.send(Cmd::Swing(style.swing));
+        // A loop keeps its own tempo.
+        if self.st.looper.is_none() {
+            self.set_bpm(style.bpm);
+        }
+    }
+
+    /// Starter beats and the swing slider.
+    pub(crate) fn beat_style_sheet(&mut self, p: &egui::Painter, inner: Rect, top: f32) -> bool {
+        let mut close = false;
+        let mut y = top;
+        for (i, style) in hum_engine::transport::BEAT_STYLES.iter().enumerate() {
+            let r = Rect::from_min_size(pos2(inner.left(), y), vec2(inner.width(), 56.0));
+            let tap = self.touches.button(Id::unique(("beat-style", i)), r);
+            widgets::surface(
+                p,
+                r,
+                20.0,
+                widgets::pressed(theme::SURFACE_2, tap.down),
+                theme::LINE,
+            );
+            theme::text(
+                p,
+                pos2(r.left() + 18.0, r.center().y - 1.0),
+                Align2::LEFT_BOTTOM,
+                style.name,
+                inter(15.0, 600),
+                theme::TEXT,
+            );
+            let about = theme::fit(p, style.about, inter(12.0, 400), r.width() - 36.0);
+            theme::text(
+                p,
+                pos2(r.left() + 18.0, r.center().y + 2.0),
+                Align2::LEFT_TOP,
+                &about,
+                inter(12.0, 400),
+                theme::MUTED,
+            );
+            if tap.clicked {
+                self.apply_style(style);
+                self.show_toast(&format!("{} beat loaded", style.name));
+                close = true;
+            }
+            y += 64.0;
+        }
+        y += 4.0;
+        let r = Rect::from_min_size(pos2(inner.left(), y), vec2(inner.width(), 56.0));
+        let track = Rect::from_min_max(pos2(r.left(), r.top() + 22.0), r.max);
+        let id = Id::unique("beat-swing");
+        self.touches.claim(id, track);
+        let drag = self
+            .touches
+            .owned(id)
+            .filter(|t| !t.ended)
+            .last()
+            .map(|t| t.pos.x);
+        if let Some(x) = drag {
+            let v = ((x - track.left() - 10.0) / (track.width() - 20.0)).clamp(0.0, 1.0);
+            let v = if v < 0.04 { 0.0 } else { v };
+            if v != self.st.swing {
+                self.st.swing = v;
+                self.send(Cmd::Swing(v));
+            }
+        }
+        theme::text(
+            p,
+            pos2(r.left(), r.top() + 10.0),
+            Align2::LEFT_CENTER,
+            "Swing",
+            inter(14.0, 600),
+            theme::TEXT,
+        );
+        let shown = format!("{}%", (self.st.swing * 100.0).round() as i32);
+        theme::text(
+            p,
+            pos2(r.right(), r.top() + 10.0),
+            Align2::RIGHT_CENTER,
+            &shown,
+            inter(13.0, 400),
+            theme::MUTED,
+        );
+        let (x0, x1, cy) = (track.left() + 10.0, track.right() - 10.0, track.center().y);
+        p.line_segment(
+            [pos2(x0, cy), pos2(x1, cy)],
+            egui::Stroke::new(4.0, theme::LINE),
+        );
+        let xv = x0 + (x1 - x0) * self.st.swing;
+        p.line_segment(
+            [pos2(x0, cy), pos2(xv, cy)],
+            egui::Stroke::new(4.0, theme::VIOLET),
+        );
+        p.circle_filled(pos2(xv, cy), 9.0, theme::TEXT);
+        close
+    }
+
+    /// Kit, half-time, roll editing and the Styles sheet.
+    fn beat_options(&mut self, p: &egui::Painter, rect: Rect) {
+        let gap = 8.0;
+        let w = (rect.width() - gap * 3.0) / 4.0;
+        let kit = if self.st.kit == 1 {
+            "808 kit"
+        } else {
+            "Classic"
+        };
+        let labels = [kit, "Half-time", "Rolls", "Styles"];
+        for (i, label) in labels.iter().enumerate() {
+            let r = Rect::from_min_size(
+                pos2(rect.left() + i as f32 * (w + gap), rect.top()),
+                vec2(w, rect.height()),
+            );
+            let tap = self.touches.button(Id::unique(("beat-option", i)), r);
+            let on = match i {
+                0 => self.st.kit == 1,
+                1 => self.st.half_time,
+                2 => self.roll_mode,
+                _ => false,
+            };
+            let (fill, border, color) = if on {
+                (theme::SURFACE_3, theme::VIOLET, theme::TEXT)
+            } else {
+                (theme::SURFACE, theme::LINE, theme::TEXT)
+            };
+            widgets::surface(p, r, 22.0, widgets::pressed(fill, tap.down), border);
+            let style = inter(13.0, if on { 600 } else { 500 });
+            let text = theme::fit(p, label, style, r.width() - 10.0);
+            theme::text(p, r.center(), Align2::CENTER_CENTER, &text, style, color);
+            if !tap.clicked {
+                continue;
+            }
+            match i {
+                0 => {
+                    self.st.kit = 1 - self.st.kit.min(1);
+                    self.send(Cmd::SetKit(self.st.kit));
+                }
+                1 => {
+                    self.st.half_time = !self.st.half_time;
+                    self.send(Cmd::HalfTime(self.st.half_time));
+                }
+                2 => {
+                    self.roll_mode = !self.roll_mode;
+                    if self.roll_mode {
+                        self.show_toast("Tap a step to give it a triplet roll");
+                    }
+                }
+                _ => self.sheet = Some(crate::app::Sheet::BeatStyle),
+            }
+        }
+    }
+
     fn random(&mut self) -> u32 {
         let mut x = self.rng;
         x ^= x << 13;
@@ -46,7 +213,12 @@ impl HumApp {
 
         let playing = self.status.beat_on && self.status.running;
         let step = if playing && self.status.step >= 0 {
-            Some((self.status.step % 16) as usize)
+            let s = if self.st.half_time {
+                self.status.step / 2
+            } else {
+                self.status.step
+            };
+            Some((s % 16) as usize)
         } else {
             None
         };
@@ -83,6 +255,16 @@ impl HumApp {
                     );
                     let on = self.st.patterns[drum] >> s & 1 == 1;
                     let mut color = if on { theme::VIOLET } else { theme::LINE };
+                    if on && self.st.rolls[self.drum] >> s & 1 == 1 {
+                        // A roll: three small dots.
+                        for k in 0..3 {
+                            p.circle_filled(
+                                r.left_top() + vec2(14.0 + k as f32 * 8.0, 14.0),
+                                2.8,
+                                theme::ON_VIOLET,
+                            );
+                        }
+                    }
                     if step == Some(s) {
                         color = if on { theme::AMBER } else { theme::BAR_LINE };
                     }
@@ -132,6 +314,13 @@ impl HumApp {
                 );
             }
         }
+        y += 44.0 + GAP;
+
+        // ---- kit, half-time, rolls, styles -------------------------------------
+        self.beat_options(
+            &p,
+            Rect::from_min_size(pos2(rect.left(), y), vec2(rect.width(), 44.0)),
+        );
         y += 44.0 + GAP;
 
         // ---- transport row (bottom) ----------------------------------------
@@ -221,7 +410,19 @@ impl HumApp {
             let tap = self.touches.button(Id::unique(("step", s)), r);
             if tap.pressed {
                 // Toggle on touch-down so tapping feels immediate.
-                self.set_pattern(self.drum, self.st.patterns[self.drum] ^ (1 << s));
+                let bit = 1u16 << s;
+                let (pattern, rolls) = (self.st.patterns[self.drum], self.st.rolls[self.drum]);
+                if self.roll_mode {
+                    self.set_rolls(self.drum, rolls ^ bit);
+                    if rolls & bit == 0 && pattern & bit == 0 {
+                        self.set_pattern(self.drum, pattern | bit);
+                    }
+                } else {
+                    self.set_pattern(self.drum, pattern ^ bit);
+                    if pattern & bit != 0 && rolls & bit != 0 {
+                        self.set_rolls(self.drum, rolls & !bit);
+                    }
+                }
                 self.haptic();
             }
             let on = self.st.patterns[self.drum] >> s & 1 == 1;

@@ -14,11 +14,12 @@ use rustysynth::Synthesizer;
 
 use crate::dsp::{smooth_coef, Rng, TAU};
 use crate::fx::{Chorus, Compressor, Delay, Limiter, Reverb};
+use crate::haze::{Glitch, Haze, HazeAmounts};
 use crate::preset::{ArpPattern, Preset};
 use crate::presets::{self, PRESETS};
 use crate::scale::KeyMap;
 use crate::transport::{
-    Transport, DEFAULT_PATTERNS, DRUMS, LOOP_STEPS, MAX_BPM, MIN_BPM, STEPS_PER_BAR,
+    Transport, DEFAULT_BPM, DEFAULT_PATTERNS, DRUMS, LOOP_STEPS, MAX_BPM, MIN_BPM, STEPS_PER_BAR,
 };
 use crate::voice::{BlockCtx, Buses, Macros, Voice, MAX_BLOCK};
 
@@ -36,21 +37,6 @@ pub const fn sf_sound(bank: u16, program: u16) -> SoundId {
 
 /// Glide time between legato notes (wind instruments).
 const LEGATO_GLIDE: f32 = 0.07;
-/// Chords the accompaniment can hold.
-pub const ACC_CHORDS: usize = 256;
-/// Notes in one strummed chord.
-pub const STRUM_NOTES: usize = 8;
-/// Accompaniment patterns (index for [`Cmd::AccPattern`]).
-pub const ACC_PATTERNS: [&str; 7] = [
-    "Down",
-    "Down-up",
-    "Folk",
-    "Piano",
-    "Piano 8ths",
-    "Arpeggio",
-    "Ballad",
-];
-
 /// SoundFont output level relative to the synth voices.
 const SF_GAIN: f32 = 7.0;
 /// MIDI channels used for SoundFont parts: the live part and 8 layers.
@@ -165,8 +151,6 @@ pub struct Status {
     pub pos: f32,
     /// Current step, or -1 when stopped.
     pub step: i32,
-    /// Accompaniment: index of the chord playing, or -1 when off.
-    pub acc_index: i32,
     pub active_voices: u32,
 }
 
@@ -180,12 +164,17 @@ pub struct Shared {
     pub release: AtomicF32,
     pub reverb: AtomicF32,
     pub volume: AtomicF32,
+    // Haze amounts, all 0..1 (0 = off).
+    pub drive: AtomicF32,
+    pub crush: AtomicF32,
+    pub tape: AtomicF32,
+    pub shimmer: AtomicF32,
+    pub pump: AtomicF32,
     // audio -> UI: status.
     flags: AtomicU32,
     loop_steps: AtomicU32,
     pos: AtomicF32,
     step: AtomicI32,
-    acc: AtomicI32,
     voices: AtomicU32,
 }
 
@@ -198,17 +187,39 @@ impl Default for Shared {
             release: AtomicF32::new(RELEASE_DEFAULT),
             reverb: AtomicF32::new(PRESETS[presets::DEFAULT_PRESET].reverb),
             volume: AtomicF32::new(VOLUME_DEFAULT),
+            drive: AtomicF32::new(0.0),
+            crush: AtomicF32::new(0.0),
+            tape: AtomicF32::new(0.0),
+            shimmer: AtomicF32::new(0.0),
+            pump: AtomicF32::new(0.0),
             flags: AtomicU32::new(0),
             loop_steps: AtomicU32::new(NO_LOOP_STEPS),
             pos: AtomicF32::new(0.0),
             step: AtomicI32::new(-1),
-            acc: AtomicI32::new(-1),
             voices: AtomicU32::new(0),
         }
     }
 }
 
 impl Shared {
+    pub fn haze(&self) -> HazeAmounts {
+        HazeAmounts {
+            drive: self.drive.get().clamp(0.0, 1.0),
+            crush: self.crush.get().clamp(0.0, 1.0),
+            tape: self.tape.get().clamp(0.0, 1.0),
+            shimmer: self.shimmer.get().clamp(0.0, 1.0),
+            pump: self.pump.get().clamp(0.0, 1.0),
+        }
+    }
+
+    pub fn set_haze(&self, a: HazeAmounts) {
+        self.drive.set(a.drive);
+        self.crush.set(a.crush);
+        self.tape.set(a.tape);
+        self.shimmer.set(a.shimmer);
+        self.pump.set(a.pump);
+    }
+
     pub fn status(&self) -> Status {
         let f = self.flags.load(Ordering::Relaxed);
         Status {
@@ -222,7 +233,6 @@ impl Shared {
             loop_steps: self.loop_steps.load(Ordering::Relaxed),
             pos: self.pos.get(),
             step: self.step.load(Ordering::Relaxed),
-            acc_index: self.acc.load(Ordering::Relaxed),
             active_voices: self.voices.load(Ordering::Relaxed),
         }
     }
@@ -317,32 +327,28 @@ pub enum Cmd {
     ClearAll,
     /// One note at a time with legato glides (wind instruments).
     SetMono(bool),
-    /// Strum (or block) a chord with the live sound: notes low to high,
-    /// played `spread_ms` apart (upwards strums go high to low). Unless
-    /// `ring`, the previous strum is released first.
-    Strum {
-        notes: [u8; STRUM_NOTES],
-        count: u8,
-        velocity: u8,
-        spread_ms: u8,
-        up: bool,
-        ring: bool,
+    /// "Drag": everything `semis` lower (may be fractional) and the tempo
+    /// times `tempo` (e.g. 0.8). `semis` 0 and `tempo` 1 switch it off.
+    SetDrag {
+        semis: f32,
+        tempo: f32,
     },
-    /// Release the notes of the last strum.
-    StrumRelease,
-    /// Replace the accompaniment's chord list: AccBegin, AccChord..., in
-    /// song order; each chord lasts `steps` sixteenths.
-    AccBegin,
-    AccChord {
-        notes: [u8; STRUM_NOTES],
-        count: u8,
-        steps: u16,
+    /// Repeat the last 1/`division` note of the mix while held (4, 8, 16 or
+    /// 32); 0 lets go.
+    Stutter(u8),
+    /// Wind the whole mix down like a tape machine stopping; false lets go.
+    TapeStop(bool),
+    /// Beat maker kit: 0 = classic, 1 = 808.
+    SetKit(u8),
+    /// Triplet rolls: bit i = step i + 1 of `drum` plays three quick hits.
+    SetRolls {
+        drum: u8,
+        bits: u16,
     },
-    /// Pattern index into [`ACC_PATTERNS`].
-    AccPattern(u8),
-    AccPlay(bool),
-    /// Continue the accompaniment from chord `index`.
-    AccJump(u16),
+    /// Half-time beats: each beat step lasts two sixteenths.
+    HalfTime(bool),
+    /// Swing for the beat maker, 0..1 (delays every second sixteenth).
+    Swing(f32),
 }
 
 /// Why a capture did not produce a layer.
@@ -461,14 +467,6 @@ impl Layer {
 
 const NEVER: u64 = u64::MAX;
 
-/// One chord of the accompaniment.
-#[derive(Clone, Copy, Debug, Default)]
-struct AccChord {
-    notes: [u8; STRUM_NOTES],
-    count: u8,
-    steps: u16,
-}
-
 struct ArpState {
     held: [bool; KEY_SLOTS],
     velocity: u8,
@@ -526,20 +524,6 @@ pub struct Engine {
     mono_current: Option<u8>,
     mono_velocity: u8,
 
-    /// Strum notes waiting to sound: (samples to wait, note, velocity).
-    strum_pending: [(u64, u8, u8); STRUM_NOTES],
-    strum_pending_len: usize,
-    strum_sounding: [u8; 16],
-    strum_sounding_len: usize,
-
-    acc_chords: Box<[AccChord]>,
-    acc_len: usize,
-    acc_on: bool,
-    acc_index: usize,
-    /// Steps left in the current chord.
-    acc_left: u32,
-    acc_pattern: u8,
-    acc_arp: usize,
     preview_off: u64,
 
     transport: Transport,
@@ -548,6 +532,25 @@ pub struct Engine {
     loop_on: bool,
     metronome: bool,
     patterns: [u16; DRUMS],
+    rolls: [u16; DRUMS],
+    half_time: bool,
+    swing: f32,
+    /// Drum hits waiting to sound: (samples to wait, preset, velocity).
+    drum_pending: [(u64, u8, u8); 32],
+    drum_pending_len: usize,
+
+    haze: Haze,
+    haze_now: HazeAmounts,
+    shimmer_fb: [f32; 2],
+    glitch: Glitch,
+    /// The tempo the user set (the transport runs at `user_bpm * drag_tempo`).
+    user_bpm: f32,
+    drag_tempo: f32,
+    drag_semis: f32,
+    /// Current (smoothed) drag pitch in semitones.
+    drag_pitch: f32,
+    /// Pitch bend last sent to each SoundFont channel.
+    sf_bend: [i32; SF_CHANNELS],
     drum_presets: [u8; DRUMS],
     layers: [Layer; LAYERS],
     has_loop: bool,
@@ -617,17 +620,6 @@ impl Engine {
             mono_len: 0,
             mono_current: None,
             mono_velocity: 100,
-            strum_pending: [(0, 0, 0); STRUM_NOTES],
-            strum_pending_len: 0,
-            strum_sounding: [0; 16],
-            strum_sounding_len: 0,
-            acc_chords: vec![AccChord::default(); ACC_CHORDS].into_boxed_slice(),
-            acc_len: 0,
-            acc_on: false,
-            acc_index: 0,
-            acc_left: 0,
-            acc_pattern: 0,
-            acc_arp: 0,
             preview_off: NEVER,
             transport: Transport::new(sample_rate),
             next_step: 0,
@@ -635,6 +627,20 @@ impl Engine {
             loop_on: false,
             metronome: false,
             patterns: DEFAULT_PATTERNS,
+            rolls: [0; DRUMS],
+            half_time: false,
+            swing: 0.0,
+            drum_pending: [(0, 0, 0); 32],
+            drum_pending_len: 0,
+            haze: Haze::new(sample_rate),
+            haze_now: HazeAmounts::default(),
+            shimmer_fb: [0.0; 2],
+            glitch: Glitch::new(sample_rate),
+            user_bpm: DEFAULT_BPM,
+            drag_tempo: 1.0,
+            drag_semis: 0.0,
+            drag_pitch: 0.0,
+            sf_bend: [-1; SF_CHANNELS],
             drum_presets,
             layers: std::array::from_fn(|_| Layer::new()),
             has_loop: false,
@@ -703,6 +709,7 @@ impl Engine {
     pub fn set_synth(&mut self, synth: Box<Synthesizer>) -> Option<Box<Synthesizer>> {
         self.sf_sound = [SoundId::MAX; SF_CHANNELS];
         self.sf_cc = [[-1; 4]; SF_CHANNELS];
+        self.sf_bend = [-1; SF_CHANNELS];
         self.sf.replace(synth)
     }
 
@@ -711,7 +718,7 @@ impl Engine {
     }
 
     pub fn bpm(&self) -> f32 {
-        self.transport.bpm()
+        self.user_bpm
     }
 
     pub fn active_voices(&self) -> usize {
@@ -768,9 +775,40 @@ impl Engine {
             }
             Cmd::SetKeyMap(map) => self.keymap = map,
             Cmd::SetBpm(bpm) => {
-                self.transport.set_bpm(bpm);
+                self.user_bpm = bpm.clamp(MIN_BPM, MAX_BPM);
+                self.transport.set_bpm(self.user_bpm * self.drag_tempo);
                 self.update_delay();
             }
+            Cmd::SetDrag { semis, tempo } => {
+                self.drag_semis = semis.clamp(-12.0, 0.0);
+                self.drag_tempo = tempo.clamp(0.5, 1.0);
+                self.transport.set_bpm(self.user_bpm * self.drag_tempo);
+                self.update_delay();
+            }
+            Cmd::Stutter(division) => {
+                let seconds = if division == 0 {
+                    0.0
+                } else {
+                    60.0 / self.transport.bpm() * 4.0 / f32::from(division)
+                };
+                self.glitch.stutter(seconds);
+            }
+            Cmd::TapeStop(on) => self.glitch.tape_stop(on),
+            Cmd::SetKit(kit) => {
+                let names = if kit == 1 {
+                    presets::BEAT_DRUMS_808
+                } else {
+                    presets::BEAT_DRUMS
+                };
+                self.drum_presets = names.map(|name| presets::find(name).unwrap_or(0) as u8);
+            }
+            Cmd::SetRolls { drum, bits } => {
+                if let Some(r) = self.rolls.get_mut(drum as usize) {
+                    *r = bits;
+                }
+            }
+            Cmd::HalfTime(on) => self.half_time = on,
+            Cmd::Swing(amount) => self.swing = amount.clamp(0.0, 1.0),
             Cmd::SetPattern { drum, bits } => {
                 if let Some(p) = self.patterns.get_mut(drum as usize) {
                     *p = bits;
@@ -908,64 +946,6 @@ impl Engine {
                     self.mono = on;
                 }
             }
-            Cmd::Strum {
-                notes,
-                count,
-                velocity,
-                spread_ms,
-                up,
-                ring,
-            } => {
-                self.strum(
-                    &notes[..usize::from(count).min(STRUM_NOTES)],
-                    velocity,
-                    spread_ms,
-                    up,
-                    ring,
-                );
-            }
-            Cmd::StrumRelease => self.strum_release(),
-            Cmd::AccBegin => {
-                self.acc_len = 0;
-                self.acc_index = 0;
-                self.acc_left = 0;
-            }
-            Cmd::AccChord {
-                notes,
-                count,
-                steps,
-            } => {
-                if self.acc_len < ACC_CHORDS {
-                    self.acc_chords[self.acc_len] = AccChord {
-                        notes,
-                        count: count.min(STRUM_NOTES as u8),
-                        steps: steps.max(1),
-                    };
-                    self.acc_len += 1;
-                }
-            }
-            Cmd::AccPattern(p) => self.acc_pattern = p.min(ACC_PATTERNS.len() as u8 - 1),
-            Cmd::AccPlay(on) => {
-                if on && self.acc_len > 0 {
-                    self.acc_on = true;
-                    self.acc_index = self.acc_index.min(self.acc_len - 1);
-                    self.acc_left = u32::from(self.acc_chords[self.acc_index].steps);
-                    self.acc_arp = 0;
-                    self.ensure_running();
-                } else {
-                    self.acc_on = false;
-                    self.strum_release();
-                    self.maybe_stop();
-                }
-            }
-            Cmd::AccJump(index) => {
-                if self.acc_len > 0 {
-                    self.acc_index = usize::from(index).min(self.acc_len - 1);
-                    self.acc_left = u32::from(self.acc_chords[self.acc_index].steps);
-                    self.acc_arp = 0;
-                    self.strum_release();
-                }
-            }
             Cmd::ClearAll => {
                 for i in 0..LAYERS {
                     self.clear_layer(i);
@@ -1012,7 +992,7 @@ impl Engine {
         if !self.layers.iter().any(|l| l.active) {
             self.loop_on = false;
         }
-        if !self.beat_on && !self.loop_on && !self.acc_on && self.transport.running {
+        if !self.beat_on && !self.loop_on && self.transport.running {
             self.transport.stop();
             self.next_step = 0;
             for i in 0..LAYERS {
@@ -1077,7 +1057,6 @@ impl Engine {
         if let Some(note) = self.arp.note.take() {
             self.live_off(note);
         }
-        self.strum_release();
         self.mono_len = 0;
         self.mono_current = None;
         self.release_part(PART_LIVE);
@@ -1161,150 +1140,6 @@ impl Engine {
         }
         self.note_off(PART_LIVE, from);
         self.note_on(PART_LIVE, self.live_sound, to, self.mono_velocity);
-    }
-
-    // ------------------------------------------------------------------
-    // Strums and accompaniment
-
-    fn strum(&mut self, notes: &[u8], velocity: u8, spread_ms: u8, up: bool, ring: bool) {
-        if !ring {
-            self.strum_release();
-        }
-        let spread = (f32::from(spread_ms) * 0.001 * self.sample_rate) as u64;
-        let count = notes.len();
-        for k in 0..count {
-            let note = if up { notes[count - 1 - k] } else { notes[k] };
-            // Later strings are a little softer; up-strums softer overall.
-            let taper = 1.0 - 0.05 * k as f32;
-            let base = if up {
-                f32::from(velocity) * 0.85
-            } else {
-                f32::from(velocity)
-            };
-            let vel = (base * taper).clamp(1.0, 127.0) as u8;
-            if self.strum_pending_len < STRUM_NOTES {
-                self.strum_pending[self.strum_pending_len] = (k as u64 * spread, note, vel);
-                self.strum_pending_len += 1;
-            }
-        }
-    }
-
-    fn strum_release(&mut self) {
-        self.strum_pending_len = 0;
-        for i in 0..self.strum_sounding_len {
-            let note = self.strum_sounding[i];
-            self.note_off(PART_LIVE, note);
-            self.remember(note, 0);
-        }
-        self.strum_sounding_len = 0;
-    }
-
-    /// Sound the strum notes that are due now.
-    fn strum_due(&mut self) {
-        let mut i = 0;
-        while i < self.strum_pending_len {
-            let (wait, note, vel) = self.strum_pending[i];
-            if wait > 0 {
-                i += 1;
-                continue;
-            }
-            self.strum_pending
-                .copy_within(i + 1..self.strum_pending_len, i);
-            self.strum_pending_len -= 1;
-            if let Some(j) = self.strum_sounding[..self.strum_sounding_len]
-                .iter()
-                .position(|&n| n == note)
-            {
-                // Re-striking a ringing string.
-                self.note_off(PART_LIVE, note);
-                self.remember(note, 0);
-                self.strum_sounding
-                    .copy_within(j + 1..self.strum_sounding_len, j);
-                self.strum_sounding_len -= 1;
-            }
-            if self.strum_sounding_len == self.strum_sounding.len() {
-                let oldest = self.strum_sounding[0];
-                self.note_off(PART_LIVE, oldest);
-                self.remember(oldest, 0);
-                self.strum_sounding.copy_within(1.., 0);
-                self.strum_sounding_len -= 1;
-            }
-            self.note_on(PART_LIVE, self.live_sound, note, vel);
-            self.remember(note, vel);
-            self.strum_sounding[self.strum_sounding_len] = note;
-            self.strum_sounding_len += 1;
-        }
-    }
-
-    /// One accompaniment step (a sixteenth) on the shared clock.
-    fn acc_step(&mut self) {
-        if self.acc_len == 0 {
-            return;
-        }
-        if self.acc_left == 0 {
-            self.acc_index = (self.acc_index + 1) % self.acc_len;
-            self.acc_left = u32::from(self.acc_chords[self.acc_index].steps);
-            self.acc_arp = 0;
-            self.strum_release();
-        }
-        let chord = self.acc_chords[self.acc_index];
-        let pos = (u32::from(chord.steps) - self.acc_left) % 16;
-        self.acc_left -= 1;
-        let n = usize::from(chord.count);
-        if n == 0 {
-            return;
-        }
-        let notes = &chord.notes[..n];
-        let accent = if pos == 0 { 112 } else { 96 };
-        // Patterns: 0 Down, 1 Down-up, 2 Folk, 3 Piano, 4 Piano 8ths,
-        // 5 Arpeggio, 6 Ballad.
-        let down = |p: u32| matches!(p, 0 | 4 | 8 | 12);
-        let (strum_down, strum_up, block, arp, bass) = match self.acc_pattern {
-            0 => (down(pos), false, false, false, false),
-            1 => (
-                down(pos),
-                matches!(pos, 2 | 6 | 10 | 14),
-                false,
-                false,
-                false,
-            ),
-            2 => (
-                matches!(pos, 0 | 4 | 12),
-                matches!(pos, 6 | 10 | 14),
-                false,
-                false,
-                false,
-            ),
-            3 => (false, false, pos == 0 || pos == 8, false, false),
-            4 => (false, false, pos.is_multiple_of(2), false, false),
-            5 => (false, false, false, pos.is_multiple_of(2), false),
-            _ => (
-                false,
-                false,
-                false,
-                pos.is_multiple_of(2) && !pos.is_multiple_of(8),
-                pos.is_multiple_of(8),
-            ),
-        };
-        if strum_down {
-            self.strum(notes, accent, 14, false, false);
-        } else if strum_up {
-            let top = &notes[n.saturating_sub(4)..];
-            self.strum(top, 80, 10, true, false);
-        } else if block {
-            self.strum(notes, accent - 8, 3, false, false);
-        } else if bass {
-            self.strum(&notes[..1], accent, 0, false, true);
-        } else if arp {
-            let pool = if self.acc_pattern == 6 && n > 1 {
-                &notes[1..]
-            } else {
-                notes
-            };
-            let note = pool[self.acc_arp % pool.len()];
-            self.acc_arp += 1;
-            self.strum(&[note], 90, 0, false, true);
-        }
     }
 
     /// Unwrapped transport position in steps.
@@ -1558,6 +1393,19 @@ impl Engine {
                     self.sf_cc[ch][k] = values[k];
                 }
             }
+            // Drag: pitch bend with a 12-semitone range.
+            let bend = (8192.0 + self.drag_pitch / 12.0 * 8192.0)
+                .round()
+                .clamp(0.0, 16383.0) as i32;
+            if self.sf_bend[ch] != bend {
+                if self.sf_bend[ch] < 0 {
+                    sf.process_midi_message(ch as i32, 0xB0, 101, 0);
+                    sf.process_midi_message(ch as i32, 0xB0, 100, 0);
+                    sf.process_midi_message(ch as i32, 0xB0, 6, 12);
+                }
+                sf.process_midi_message(ch as i32, 0xE0, bend & 0x7F, bend >> 7);
+                self.sf_bend[ch] = bend;
+            }
         }
     }
 
@@ -1650,11 +1498,12 @@ impl Engine {
             self.has_loop = true;
             self.loop_steps = steps;
             self.transport.set_bpm(bpm);
+            self.user_bpm = (self.transport.bpm() / self.drag_tempo).clamp(MIN_BPM, MAX_BPM);
             self.update_delay();
             self.restart_transport();
             self.emit(EngineEvent::LoopStarted {
                 steps: steps as u16,
-                bpm: self.transport.bpm(),
+                bpm: self.user_bpm,
             });
             (count, start as f64, f64::from(steps) / (now - start) as f64)
         } else {
@@ -1749,27 +1598,64 @@ impl Engine {
     fn on_step(&mut self, step: i64) {
         self.shared.step.store(step as i32, Ordering::Relaxed);
         let in_bar = step.rem_euclid(STEPS_PER_BAR as i64) as usize;
-        if step >= 0 && self.beat_on {
+        if step >= 0 && self.beat_on && (!self.half_time || step % 2 == 0) {
+            let (beat_step, step_len) = if self.half_time {
+                (step / 2, self.transport.samples_per_step() * 2.0)
+            } else {
+                (step, self.transport.samples_per_step())
+            };
+            let pos = beat_step.rem_euclid(STEPS_PER_BAR as i64) as usize;
+            // Swing pushes every second sixteenth late (up to a triplet feel).
+            let swing = if pos % 2 == 1 {
+                f64::from(self.swing) * step_len / 3.0
+            } else {
+                0.0
+            };
             for drum in 0..DRUMS {
-                if self.patterns[drum] >> in_bar & 1 == 1 {
-                    let velocity = if in_bar.is_multiple_of(4) { 112 } else { 96 };
-                    self.note_on(
-                        PART_DRUMS,
-                        SoundId::from(self.drum_presets[drum]),
-                        60,
-                        velocity,
-                    );
+                if self.patterns[drum] >> pos & 1 == 0 {
+                    continue;
+                }
+                let velocity = if pos.is_multiple_of(4) { 112 } else { 96 };
+                let preset = self.drum_presets[drum];
+                if self.rolls[drum] >> pos & 1 == 1 {
+                    for (k, v) in [velocity, 78, 92].into_iter().enumerate() {
+                        let wait = swing + step_len * k as f64 / 3.0;
+                        self.queue_drum(wait as u64, preset, v);
+                    }
+                } else {
+                    self.queue_drum(swing as u64, preset, velocity);
                 }
             }
-        }
-        if step >= 0 && self.acc_on {
-            self.acc_step();
+            self.drums_due();
         }
         if self.metronome && in_bar.is_multiple_of(4) {
             let accent = in_bar == 0;
             self.click_inc = if accent { 1568.0 } else { 1046.5 } / self.sample_rate;
             self.click_phase = 0.0;
             self.click_env = if accent { 0.32 } else { 0.22 };
+        }
+    }
+
+    fn queue_drum(&mut self, wait: u64, preset: u8, velocity: u8) {
+        if self.drum_pending_len < self.drum_pending.len() {
+            self.drum_pending[self.drum_pending_len] = (wait, preset, velocity);
+            self.drum_pending_len += 1;
+        }
+    }
+
+    /// Play the queued drum hits that are due now.
+    fn drums_due(&mut self) {
+        let mut i = 0;
+        while i < self.drum_pending_len {
+            let (wait, preset, velocity) = self.drum_pending[i];
+            if wait > 0 {
+                i += 1;
+                continue;
+            }
+            self.drum_pending
+                .copy_within(i + 1..self.drum_pending_len, i);
+            self.drum_pending_len -= 1;
+            self.note_on(PART_DRUMS, SoundId::from(preset), 60, velocity);
         }
     }
 
@@ -1825,13 +1711,13 @@ impl Engine {
         if self.arp.next == 0 {
             self.arp_step();
         }
-        self.strum_due();
+        self.drums_due();
     }
 
     /// Samples until the next scheduled event (at least 1).
     fn next_event_distance(&self) -> u64 {
         let mut d = self.preview_off.min(self.arp.next).min(self.arp.off);
-        for &(wait, _, _) in &self.strum_pending[..self.strum_pending_len] {
+        for &(wait, _, _) in &self.drum_pending[..self.drum_pending_len] {
             d = d.min(wait);
         }
         if self.transport.running {
@@ -1856,7 +1742,7 @@ impl Engine {
                 *t = t.saturating_sub(n64);
             }
         }
-        for p in self.strum_pending[..self.strum_pending_len].iter_mut() {
+        for p in self.drum_pending[..self.drum_pending_len].iter_mut() {
             p.0 = p.0.saturating_sub(n64);
         }
         self.now += n64;
@@ -1890,6 +1776,10 @@ impl Engine {
         let volume_target = volume_gain(self.shared.volume.get());
         let volume_coef = smooth_coef(0.02, 1.0 / self.sample_rate);
         let click_decay = (-1.0 / (0.018 * self.sample_rate)).exp();
+        let haze_target = self.shared.haze();
+        // Shimmer: a longer reverb whose tail climbs an octave.
+        self.reverb
+            .set_feedback(0.86 + 0.08 * self.haze_now.shimmer);
 
         let mut done = 0usize;
         while done < frames {
@@ -1906,6 +1796,14 @@ impl Engine {
             glide(&mut m.attack, targets.attack, coef);
             glide(&mut m.release, targets.release, coef);
             glide(&mut m.reverb, targets.reverb, coef);
+            let h = &mut self.haze_now;
+            glide(&mut h.drive, haze_target.drive, coef);
+            glide(&mut h.crush, haze_target.crush, coef);
+            glide(&mut h.tape, haze_target.tape, coef);
+            glide(&mut h.shimmer, haze_target.shimmer, coef);
+            glide(&mut h.pump, haze_target.pump, coef);
+            let drag_coef = smooth_coef(0.12, n as f32 / self.sample_rate);
+            glide(&mut self.drag_pitch, self.drag_semis, drag_coef);
 
             for frame in self.buses.dry[..n]
                 .iter_mut()
@@ -1919,6 +1817,7 @@ impl Engine {
                 sample_rate: self.sample_rate,
                 bpm: self.transport.bpm(),
                 macros: Macros::NEUTRAL,
+                pitch: self.drag_pitch,
             };
             for v in self.voices.iter_mut() {
                 if v.active {
@@ -1934,11 +1833,28 @@ impl Engine {
                 }
             }
 
+            let haze = self.haze_now;
+            let step_len = self.transport.samples_per_step();
+            let beat_start = if self.transport.running {
+                self.transport.pos() / 4.0
+            } else {
+                self.now as f64 / (step_len * 4.0)
+            };
             for i in 0..n {
                 let dry = self.buses.dry[i];
                 let ch = self.chorus.process(self.buses.chorus[i]);
                 let dl = self.delay.process(self.buses.delay[i]);
-                let rv = self.reverb.process(self.buses.reverb[i]);
+                let mut send = self.buses.reverb[i];
+                if haze.shimmer > 0.0 {
+                    let sh = self.shimmer_fb;
+                    send[0] += sh[0] + dry[0] * haze.shimmer * 0.5;
+                    send[1] += sh[1] + dry[1] * haze.shimmer * 0.5;
+                }
+                let rv = self.reverb.process(send);
+                let fb = self.haze.shimmer(rv, haze.shimmer);
+                // Keep the shimmer loop well below unity gain.
+                let k = haze.shimmer * 0.28;
+                self.shimmer_fb = [(fb[0] * k).tanh(), (fb[1] * k).tanh()];
                 let mut l = dry[0] + ch[0] * CHORUS_RETURN + dl[0] + rv[0] * REVERB_RETURN;
                 let mut r = dry[1] + ch[1] * CHORUS_RETURN + dl[1] + rv[1] * REVERB_RETURN;
                 if self.click_env > 1.0e-4 {
@@ -1951,6 +1867,9 @@ impl Engine {
                     l += s;
                     r += s;
                 }
+                let beat = (beat_start + i as f64 / (step_len * 4.0)).fract() as f32;
+                let [l, r] = self.haze.process([l, r], &haze, beat);
+                let [l, r] = self.glitch.process([l, r]);
                 self.volume += (volume_target - self.volume) * volume_coef;
                 let y = self.compressor.process([l * self.volume, r * self.volume]);
                 let y = self.limiter.process(y);
@@ -1982,12 +1901,6 @@ impl Engine {
         if !self.transport.running {
             s.step.store(-1, Ordering::Relaxed);
         }
-        let acc = if self.acc_on {
-            self.acc_index as i32
-        } else {
-            -1
-        };
-        s.acc.store(acc, Ordering::Relaxed);
         s.voices
             .store(self.active_voices() as u32, Ordering::Relaxed);
     }

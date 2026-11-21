@@ -45,19 +45,17 @@ impl Hooks {
 pub enum Tab {
     Play,
     Sounds,
-    Songs,
     Loop,
     Beats,
 }
 
 impl Tab {
-    const ALL: [Tab; 5] = [Tab::Play, Tab::Sounds, Tab::Songs, Tab::Loop, Tab::Beats];
+    const ALL: [Tab; 4] = [Tab::Play, Tab::Sounds, Tab::Loop, Tab::Beats];
 
     fn label(self) -> &'static str {
         match self {
             Tab::Play => "Play",
             Tab::Sounds => "Sounds",
-            Tab::Songs => "Songs",
             Tab::Loop => "Loop",
             Tab::Beats => "Beats",
         }
@@ -69,6 +67,8 @@ pub enum Sheet {
     Key,
     Scale,
     ConfirmClearAll,
+    /// Starter beats and swing.
+    BeatStyle,
     /// Mix settings for one loop layer.
     Layer(usize),
 }
@@ -85,6 +85,16 @@ pub struct HumApp {
     pub(crate) touches: Touches,
     pub(crate) tab: Tab,
     pub(crate) settings_open: bool,
+    /// The Haze screen (effects on the whole mix) is open.
+    pub(crate) haze_open: bool,
+    /// Performance buttons: Drag is on, Stutter / Tape stop are held.
+    pub(crate) drag_on: bool,
+    pub(crate) stutter_held: bool,
+    pub(crate) tape_held: bool,
+    /// Beats: tapping a step toggles its triplet roll.
+    pub(crate) roll_mode: bool,
+    /// The performance buttons were drawn this frame.
+    pub(crate) fx_seen: bool,
     pub(crate) sheet: Option<Sheet>,
     pub(crate) status: Status,
     pub(crate) now: f64,
@@ -132,8 +142,6 @@ pub struct HumApp {
     /// The sound and legato setting the engine's live part last got.
     applied_sound: Option<hum_engine::engine::SoundId>,
     applied_mono: Option<bool>,
-    // Songs screen.
-    pub(crate) songs: crate::screens::SongsUi,
 
     #[cfg(not(target_os = "android"))]
     pub(crate) shots: Option<crate::devshots::Shots>,
@@ -171,6 +179,12 @@ impl HumApp {
             touches: Touches::default(),
             tab: Tab::Play,
             settings_open: false,
+            haze_open: false,
+            drag_on: false,
+            stutter_held: false,
+            tape_held: false,
+            roll_mode: false,
+            fx_seen: false,
             sheet: None,
             status: status.expect("audio host was just created"),
             now: 0.0,
@@ -199,7 +213,6 @@ impl HumApp {
             landscape: false,
             applied_sound: None,
             applied_mono: None,
-            songs: crate::screens::SongsUi::default(),
             #[cfg(not(target_os = "android"))]
             shots: crate::devshots::Shots::from_env(),
         };
@@ -235,6 +248,16 @@ impl HumApp {
                 bits: *bits,
             });
         }
+        self.send_drag();
+        self.send(Cmd::SetKit(self.st.kit));
+        for (drum, bits) in self.st.rolls.iter().enumerate() {
+            self.send(Cmd::SetRolls {
+                drum: drum as u8,
+                bits: *bits,
+            });
+        }
+        self.send(Cmd::HalfTime(self.st.half_time));
+        self.send(Cmd::Swing(self.st.swing));
         self.send(Cmd::ClearAll);
         if let Some(looper) = &self.st.looper {
             self.send(Cmd::SetLoopSteps(looper.steps));
@@ -254,7 +277,18 @@ impl HumApp {
             s.release.set(self.st.release);
             s.reverb.set(self.st.reverb);
             s.volume.set(self.st.volume);
+            s.set_haze(self.st.haze.amounts());
         }
+    }
+
+    /// Tell the engine the current Drag setting.
+    pub(crate) fn send_drag(&self) {
+        let (semis, tempo) = if self.drag_on {
+            self.st.drag.semis_tempo()
+        } else {
+            (0.0, 1.0)
+        };
+        self.send(Cmd::SetDrag { semis, tempo });
     }
 
     /// The live instrument.
@@ -287,25 +321,18 @@ impl HumApp {
     }
 
     /// Keep the engine's live sound and legato mode in step with the
-    /// screen: the song's instrument on the Songs screen, else the chosen
-    /// sound.
+    /// chosen sound and the Legato setting.
     pub(crate) fn apply_live_sound(&mut self) {
-        let (sound, mono) = match self.song_sound() {
-            Some(sound) => (sound, false),
-            None => {
-                let inst = self.instrument();
-                let mono = match self.st.legato {
-                    crate::state::Legato::Auto => inst.group == Group::Wind,
-                    crate::state::Legato::On => !inst.drums,
-                    crate::state::Legato::Off => false,
-                };
-                (inst.sound, mono)
-            }
+        let inst = self.instrument();
+        let mono = match self.st.legato {
+            crate::state::Legato::Auto => inst.group == Group::Wind,
+            crate::state::Legato::On => !inst.drums,
+            crate::state::Legato::Off => false,
         };
-        if self.applied_sound != Some(sound) {
+        if self.applied_sound != Some(inst.sound) {
             self.release_all_keys();
-            self.send(Cmd::SetSound(sound));
-            self.applied_sound = Some(sound);
+            self.send(Cmd::SetSound(inst.sound));
+            self.applied_sound = Some(inst.sound);
         }
         if self.applied_mono != Some(mono) {
             self.send(Cmd::SetMono(mono));
@@ -354,6 +381,7 @@ impl HumApp {
             // get their "up" event.
             self.touches.cancel_all();
             self.release_all_keys();
+            self.release_fx();
         }
         let mut reset = false;
         let mut events: Vec<EngineEvent> = Vec::new();
@@ -505,11 +533,11 @@ impl HumApp {
         self.pump_audio(&ctx);
         self.poll_export();
         self.apply_live_sound();
-        self.poll_paste();
         watchdog.enter(Stage::Insets);
         self.poll_insets(&ctx);
         watchdog.enter(Stage::Draw);
         self.keyboard_seen = false;
+        self.fx_seen = false;
         self.handle_back(&ctx);
 
         let full = ui.max_rect();
@@ -538,6 +566,8 @@ impl HumApp {
         self.touches.set_blocked(self.sheet.is_some());
         if self.settings_open {
             self.settings_screen(ui, content);
+        } else if self.haze_open {
+            self.haze_screen(ui, content);
         } else {
             let (bar, body) = if self.landscape {
                 let bar =
@@ -554,7 +584,6 @@ impl HumApp {
             match self.tab {
                 Tab::Play => self.play_screen(ui, body),
                 Tab::Sounds => self.sounds_screen(ui, body),
-                Tab::Songs => self.songs_screen(ui, body),
                 Tab::Loop => self.loop_screen(ui, body),
                 Tab::Beats => self.beats_screen(ui, body),
             }
@@ -568,6 +597,9 @@ impl HumApp {
         if !self.keyboard_seen {
             self.release_all_keys();
         }
+        if !self.fx_seen {
+            self.release_fx();
+        }
         watchdog.enter(Stage::Save);
         self.autosave(&ctx);
         watchdog.enter(Stage::Outside);
@@ -575,7 +607,7 @@ impl HumApp {
         // Repaint only while something moves or is being touched.
         let transport_visible = self.status.running
             && !self.settings_open
-            && matches!(self.tab, Tab::Loop | Tab::Beats | Tab::Songs);
+            && matches!(self.tab, Tab::Loop | Tab::Beats);
         if self.touches.any_active() || !self.trail.is_empty() || transport_visible {
             ctx.request_repaint();
         }
@@ -608,8 +640,8 @@ impl HumApp {
             self.sheet = None;
         } else if self.settings_open {
             self.settings_open = false;
-        } else if self.tab == Tab::Songs && self.songs_back() {
-            // The Songs screen closed its editor or song.
+        } else if self.haze_open {
+            self.haze_open = false;
         } else if self.tab != Tab::Play {
             self.tab = Tab::Play;
         } else {
@@ -660,7 +692,6 @@ impl HumApp {
             match tab {
                 Tab::Play => icons::keys(p, icon_c, 24.0, color),
                 Tab::Sounds => icons::bars(p, icon_c, 24.0, color),
-                Tab::Songs => icons::notes(p, icon_c, 24.0, color),
                 Tab::Loop => icons::loop_arrows(p, icon_c, 24.0, color),
                 Tab::Beats => icons::grid(p, icon_c, 24.0, color),
             }
@@ -788,6 +819,7 @@ impl HumApp {
             Sheet::Key => 20.0 + 28.0 + 14.0 + 3.0 * 48.0 + 2.0 * 8.0 + 20.0,
             Sheet::Scale => 20.0 + 28.0 + 14.0 + 7.0 * 48.0 + 6.0 * 6.0 + 20.0,
             Sheet::ConfirmClearAll => 20.0 + 28.0 + 8.0 + 40.0 + 16.0 + 48.0 + 20.0,
+            Sheet::BeatStyle => 20.0 + 28.0 + 14.0 + 3.0 * 64.0 + 4.0 + 56.0 + 20.0,
             Sheet::Layer(_) => 20.0 + 28.0 + 14.0 + 3.0 * 56.0 + 12.0 + 48.0 + 10.0 + 48.0 + 20.0,
         };
         let rect = Rect::from_min_size(
@@ -803,6 +835,7 @@ impl HumApp {
             Sheet::Key => "Key",
             Sheet::Scale => "Scale",
             Sheet::ConfirmClearAll => "Clear all layers?",
+            Sheet::BeatStyle => "Beat styles",
             Sheet::Layer(_) => "",
         };
         let layer_title;
@@ -826,6 +859,11 @@ impl HumApp {
         match sheet {
             Sheet::Layer(slot) => {
                 if self.layer_sheet(p, inner, top, slot) {
+                    close = true;
+                }
+            }
+            Sheet::BeatStyle => {
+                if self.beat_style_sheet(p, inner, top) {
                     close = true;
                 }
             }

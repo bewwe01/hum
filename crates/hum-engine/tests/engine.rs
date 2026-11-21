@@ -88,7 +88,7 @@ fn drain(e: &mut Engine) -> Vec<EngineEvent> {
 
 #[test]
 fn all_presets_render_bounded_non_silent_audio() {
-    assert_eq!(PRESETS.len(), 57);
+    assert_eq!(PRESETS.len(), 73);
     for (index, p) in PRESETS.iter().enumerate() {
         let mut e = engine();
         e.handle(Cmd::SetSound(index as u16));
@@ -710,69 +710,187 @@ fn mono_mode_plays_one_note_and_glides_back() {
     assert_clean(&out, "mono legato");
 }
 
-#[test]
-fn strums_spread_their_notes_in_time() {
-    let mut e = engine();
-    select_dry(&mut e, "Ocarina");
-    let mut notes = [0u8; 8];
-    notes[..4].copy_from_slice(&[48, 52, 55, 60]);
-    e.handle(Cmd::Strum {
-        notes,
-        count: 4,
-        velocity: 100,
-        spread_ms: 10,
-        up: false,
-        ring: false,
-    });
+/// Frames where the signal first rises above `thr` after being quiet.
+fn onsets(samples: &[f32], thr: f32) -> Vec<usize> {
     let mut out = Vec::new();
-    render(&mut e, 48, &mut out); // 1 ms
-    assert_eq!(e.active_voices(), 1);
-    render(&mut e, 960, &mut out); // 21 ms
-    assert_eq!(e.active_voices(), 3);
-    render(&mut e, 960, &mut out); // 41 ms
-    assert_eq!(e.active_voices(), 4);
-    // A new strum releases the old one before sounding.
-    e.handle(Cmd::Strum {
-        notes,
-        count: 4,
-        velocity: 100,
-        spread_ms: 0,
-        up: true,
-        ring: false,
-    });
-    e.handle(Cmd::StrumRelease);
-    render(&mut e, 48_000, &mut out);
-    assert_eq!(e.active_voices(), 0);
+    let mut quiet = usize::MAX / 2;
+    for (i, f) in samples.chunks_exact(2).enumerate() {
+        let a = f[0].abs().max(f[1].abs());
+        if a > thr {
+            if quiet > 3000 {
+                out.push(i);
+            }
+            quiet = 0;
+        } else {
+            quiet += 1;
+        }
+    }
+    out
+}
+
+/// Onsets within a few frames of the expected ones (attack time).
+fn assert_near(got: &[usize], want: &[usize], what: &str) {
+    assert_eq!(got.len(), want.len(), "{what}: {got:?}");
+    for (g, w) in got.iter().zip(want) {
+        assert!(g.abs_diff(*w) <= 24, "{what}: {got:?} vs {want:?}");
+    }
+}
+
+fn hat_only(e: &mut Engine, bits: u16) {
+    for drum in 0..4u8 {
+        e.handle(Cmd::SetPattern {
+            drum,
+            bits: if drum == 2 { bits } else { 0 },
+        });
+    }
 }
 
 #[test]
-fn accompaniment_follows_chords_on_the_clock() {
+fn beat_options_place_hits_in_time() {
+    // 60 BPM: one sixteenth = 12 000 frames.
+    let step = 12_000usize;
     let mut e = engine();
-    select_dry(&mut e, "Ocarina");
-    e.handle(Cmd::SetBpm(120.0));
-    e.handle(Cmd::AccBegin);
-    for root in [48u8, 53] {
-        let mut notes = [0u8; 8];
-        notes[..3].copy_from_slice(&[root, root + 4, root + 7]);
-        e.handle(Cmd::AccChord {
-            notes,
-            count: 3,
-            steps: 16,
+    e.shared().volume.set(1.0);
+    e.handle(Cmd::SetBpm(60.0));
+    hat_only(&mut e, 0b11);
+    e.handle(Cmd::HalfTime(true));
+    e.handle(Cmd::BeatPlay(true));
+    let mut out = Vec::new();
+    render(&mut e, step * 4, &mut out);
+    assert_near(
+        &onsets(&out, 0.05)[..2],
+        &[0, 2 * step],
+        "half-time doubles the step",
+    );
+
+    let mut e = engine();
+    e.handle(Cmd::SetBpm(60.0));
+    hat_only(&mut e, 0b10);
+    e.handle(Cmd::Swing(1.0));
+    e.handle(Cmd::BeatPlay(true));
+    let mut out = Vec::new();
+    render(&mut e, step * 3, &mut out);
+    assert_near(
+        &onsets(&out, 0.05)[..1],
+        &[step + step / 3],
+        "swing delays the second sixteenth",
+    );
+
+    let mut e = engine();
+    e.handle(Cmd::SetBpm(60.0));
+    hat_only(&mut e, 0b1);
+    e.handle(Cmd::SetRolls { drum: 2, bits: 0b1 });
+    e.handle(Cmd::BeatPlay(true));
+    let mut out = Vec::new();
+    render(&mut e, step, &mut out);
+    assert_near(
+        &onsets(&out, 0.05),
+        &[0, step / 3, 2 * step / 3],
+        "a roll is three hits",
+    );
+
+    // The 808 kit plays different drums.
+    e.handle(Cmd::SetKit(1));
+    render(&mut e, step * 16, &mut out);
+    assert_clean(&out, "808 kit");
+}
+
+/// Zero crossings per second of the left channel.
+fn frequency(samples: &[f32]) -> f32 {
+    let left: Vec<f32> = samples.chunks_exact(2).map(|f| f[0]).collect();
+    let ups = left
+        .windows(2)
+        .filter(|w| w[0] <= 0.0 && w[1] > 0.0)
+        .count();
+    ups as f32 * SR / left.len() as f32
+}
+
+#[test]
+fn drag_lowers_pitch_and_tempo() {
+    let mut e = engine();
+    select_dry(&mut e, "Soft Sine");
+    e.handle(Cmd::SetBpm(100.0));
+    e.handle(Cmd::SetDrag {
+        semis: -12.0,
+        tempo: 0.5,
+    });
+    let mut sink = Vec::new();
+    render(&mut e, 48_000, &mut sink); // let the pitch settle
+    e.handle(Cmd::NoteOn {
+        note: 69,
+        velocity: 100,
+    });
+    let mut out = Vec::new();
+    render(&mut e, 4_800, &mut sink);
+    render(&mut e, 48_000, &mut out);
+    let f = frequency(&out);
+    assert!((f - 220.0).abs() < 4.0, "A4 dragged an octave down: {f} Hz");
+    assert_eq!(e.bpm(), 100.0, "the tempo the user set is kept");
+    assert!((e.shared().status().loop_steps as f32) > 0.0);
+}
+
+#[test]
+fn haze_at_full_stays_bounded_and_settles() {
+    let mut e = engine();
+    select(&mut e, "Euphoria");
+    e.shared().volume.set(1.0);
+    e.shared().set_haze(hum_engine::haze::HazeAmounts {
+        drive: 1.0,
+        crush: 1.0,
+        tape: 1.0,
+        shimmer: 1.0,
+        pump: 1.0,
+    });
+    for note in [48u8, 55, 60, 64, 67, 72] {
+        e.handle(Cmd::NoteOn {
+            note,
+            velocity: 127,
         });
     }
-    e.handle(Cmd::AccPattern(3));
-    e.handle(Cmd::AccPlay(true));
     let mut out = Vec::new();
-    render(&mut e, 4_800, &mut out);
-    assert_eq!(e.shared().status().acc_index, 0);
-    assert!(e.active_voices() >= 3);
-    // 16 sixteenths at 120 BPM = 2 s.
     render(&mut e, 96_000, &mut out);
-    assert_eq!(e.shared().status().acc_index, 1);
-    render(&mut e, 96_000, &mut out);
-    assert_eq!(e.shared().status().acc_index, 0, "wraps around");
-    e.handle(Cmd::AccPlay(false));
-    render(&mut e, 4_800, &mut out);
-    assert_eq!(e.shared().status().acc_index, -1);
-    assert!(!e.shared().status().running);
+    assert!(peak(&out) < 1.0 && peak(&out) > 0.05, "peak {}", peak(&out));
+    assert!(out.iter().all(|s| s.is_finite()));
+    e.handle(Cmd::AllNotesOff);
+    // The shimmer loop must die away (no runaway feedback).
+    e.shared().tape.set(0.0);
+    let mut tail = Vec::new();
+    render(&mut e, 48_000 * 20, &mut tail);
+    let last = &tail[tail.len() - 48_000..];
+    assert!(peak(last) < 0.002, "tail still at {}", peak(last));
+}
+
+#[test]
+fn stutter_repeats_and_tape_stop_winds_down() {
+    let mut e = engine();
+    select_dry(&mut e, "Warm Cloud");
+    e.handle(Cmd::SetBpm(120.0));
+    e.handle(Cmd::NoteOn {
+        note: 60,
+        velocity: 110,
+    });
+    let mut out = Vec::new();
+    render(&mut e, 48_000, &mut out);
+    // 1/16 at 120 BPM = 6 000 frames.
+    e.handle(Cmd::Stutter(16));
+    let mut st = Vec::new();
+    render(&mut e, 24_000, &mut st);
+    let a = &st[2 * 6_000..2 * 6_100];
+    let b = &st[2 * 12_000..2 * 12_100];
+    for (x, y) in a.iter().zip(b) {
+        assert!((x - y).abs() < 1.0e-3, "the slice repeats");
+    }
+    e.handle(Cmd::Stutter(0));
+    e.handle(Cmd::TapeStop(true));
+    let mut ts = Vec::new();
+    render(&mut e, 72_000, &mut ts);
+    assert!(
+        peak(&ts[2 * 60_000..]) < 1.0e-3,
+        "silent once the tape has stopped"
+    );
+    e.handle(Cmd::TapeStop(false));
+    let mut back = Vec::new();
+    render(&mut e, 4_800, &mut back);
+    assert!(peak(&back[2 * 2_400..]) > 0.01, "the note is back");
+    assert_clean(&back, "after tape stop");
 }

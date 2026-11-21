@@ -24,6 +24,82 @@ pub const DEFAULT_PATTERNS: [u16; DRUMS] = [
     1 << 12,
 ];
 
+/// A pattern written as 16 characters, `x` = hit (step 1 first).
+const fn steps(s: &[u8; 16]) -> u16 {
+    let mut bits = 0u16;
+    let mut i = 0;
+    while i < 16 {
+        if s[i] == b'x' {
+            bits |= 1 << i;
+        }
+        i += 1;
+    }
+    bits
+}
+
+/// A ready-made beat for the beat maker.
+#[derive(Clone, Copy, Debug)]
+pub struct BeatStyle {
+    pub name: &'static str,
+    pub about: &'static str,
+    pub patterns: [u16; DRUMS],
+    pub rolls: [u16; DRUMS],
+    /// 0 = classic kit, 1 = 808.
+    pub kit: u8,
+    pub half_time: bool,
+    pub swing: f32,
+    pub bpm: f32,
+}
+
+/// Starter beats in the witch house mood.
+pub const BEAT_STYLES: [BeatStyle; 3] = [
+    BeatStyle {
+        name: "Witch",
+        about: "Half-time 808s, slow and heavy, with hat rolls",
+        patterns: [
+            steps(b"x.....x...x....."),
+            steps(b"........x......."),
+            steps(b"x.x.x.x.x.x.x.x."),
+            steps(b"........x......."),
+        ],
+        rolls: [0, 0, steps(b"......x.......x."), 0],
+        kit: 1,
+        half_time: true,
+        swing: 0.0,
+        bpm: 130.0,
+    },
+    BeatStyle {
+        name: "Drag",
+        about: "Slow, swung and dragging",
+        patterns: [
+            steps(b"x......x..x....."),
+            steps(b"....x.......x..."),
+            steps(b"x.x.x.x.x.x.x.xx"),
+            steps(b"............x..."),
+        ],
+        rolls: [0, 0, steps(b"...........x...x"), 0],
+        kit: 1,
+        half_time: false,
+        swing: 0.35,
+        bpm: 70.0,
+    },
+    BeatStyle {
+        name: "Rave",
+        about: "Four to the floor with open off-beat hats",
+        patterns: [
+            steps(b"x...x...x...x..."),
+            0,
+            steps(b"..x...x...x...x."),
+            steps(b"....x.......x..."),
+        ],
+        rolls: [0, 0, steps(b"...............x"), 0],
+        kit: 1,
+        half_time: false,
+        swing: 0.0,
+        bpm: 140.0,
+    },
+];
+
 /// Guards `ceil` against floating-point dust (far below one sample).
 const EPS: f64 = 1.0e-6;
 

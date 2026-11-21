@@ -52,6 +52,8 @@ pub struct BlockCtx {
     pub sample_rate: f32,
     pub bpm: f32,
     pub macros: Macros,
+    /// Pitch offset for every voice in semitones (Drag).
+    pub pitch: f32,
 }
 
 /// Stereo scratch buses a voice mixes into.
@@ -426,7 +428,7 @@ impl Voice {
             LfoDest::Amp => (0.0, 0.0, 1.0 - depth.clamp(0.0, 1.0) * (0.5 - 0.5 * lfo)),
         };
 
-        let note = self.pitch + pitch_env + lfo_pitch;
+        let note = self.pitch + pitch_env + lfo_pitch + ctx.pitch;
         let f0 = midi_to_hz(note).min(sr * 0.45);
         let inc0 = f0 * inv_sr;
 

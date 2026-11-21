@@ -120,8 +120,81 @@ pub struct Saved {
     pub play_mode: crate::keyboard::PlayMode,
     /// One note at a time with glides between notes.
     pub legato: Legato,
-    /// The song library.
-    pub songs: Vec<crate::songs::Song>,
+    /// Haze effect amounts.
+    pub haze: Haze,
+    /// How deep the Drag button drags.
+    pub drag: DragDepth,
+    /// Stutter slice: 1/8 or 1/16 note.
+    pub stutter: u8,
+    /// Beat maker: kit (0 classic, 1 808), triplet rolls, half-time, swing.
+    pub kit: u8,
+    pub rolls: [u16; 4],
+    pub half_time: bool,
+    pub swing: f32,
+}
+
+/// The five Haze amounts, 0..1.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Haze {
+    pub drive: f32,
+    pub crush: f32,
+    pub tape: f32,
+    pub shimmer: f32,
+    pub pump: f32,
+}
+
+impl Haze {
+    pub fn amounts(&self) -> hum_engine::haze::HazeAmounts {
+        hum_engine::haze::HazeAmounts {
+            drive: self.drive,
+            crush: self.crush,
+            tape: self.tape,
+            shimmer: self.shimmer,
+            pump: self.pump,
+        }
+    }
+
+    pub fn from_amounts(a: hum_engine::haze::HazeAmounts) -> Self {
+        Self {
+            drive: a.drive,
+            crush: a.crush,
+            tape: a.tape,
+            shimmer: a.shimmer,
+            pump: a.pump,
+        }
+    }
+
+    pub fn values_mut(&mut self) -> [&mut f32; 5] {
+        [
+            &mut self.drive,
+            &mut self.crush,
+            &mut self.tape,
+            &mut self.shimmer,
+            &mut self.pump,
+        ]
+    }
+
+    pub fn is_off(&self) -> bool {
+        self.amounts().is_off()
+    }
+}
+
+/// Drag: down 3 semitones at 80 % speed, or (Deep) 5 semitones at 70 %.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum DragDepth {
+    #[default]
+    Drag,
+    Deep,
+}
+
+impl DragDepth {
+    pub fn semis_tempo(self) -> (f32, f32) {
+        match self {
+            DragDepth::Drag => (-3.0, 0.8),
+            DragDepth::Deep => (-5.0, 0.7),
+        }
+    }
 }
 
 /// Legato (mono) playing: automatic for wind instruments.
@@ -171,7 +244,13 @@ impl Default for Saved {
             looper: None,
             play_mode: crate::keyboard::PlayMode::Scale,
             legato: Legato::Auto,
-            songs: Vec::new(),
+            haze: Haze::default(),
+            drag: DragDepth::Drag,
+            stutter: 8,
+            kit: 0,
+            rolls: [0; 4],
+            half_time: false,
+            swing: 0.0,
         }
     }
 }
@@ -225,10 +304,14 @@ impl Saved {
                 self.looper = None;
             }
         }
-        self.songs.truncate(200);
-        for song in &mut self.songs {
-            song.sanitize();
+        for v in self.haze.values_mut() {
+            *v = unit(*v, 0.0);
         }
+        if ![8, 16].contains(&self.stutter) {
+            self.stutter = 8;
+        }
+        self.kit = self.kit.min(1);
+        self.swing = unit(self.swing, 0.0);
         self.bpm = if self.bpm.is_finite() {
             self.bpm.clamp(MIN_BPM, MAX_BPM)
         } else {

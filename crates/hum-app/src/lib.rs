@@ -12,7 +12,6 @@ mod keyboard;
 mod looping;
 mod platform;
 mod screens;
-mod songs;
 mod state;
 mod theme;
 mod watchdog;

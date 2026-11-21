@@ -1,11 +1,13 @@
-//! The 56 built-in sounds: seven per category, in the order the app shows
-//! them. This table is the single source of truth for every sound.
+//! The built-in sounds, in the order the app shows them: seven per
+//! original category, then the Ocarina, the Crystal pack (eerie, broken,
+//! euphoric sounds) and the 808 drum kit. This table is the single source
+//! of truth for every sound.
 
 use crate::preset::{
     adsr, arp, ArpPattern, Category, Filter, Lfo, LfoDest, LfoShape, Osc, Preset, Wave,
 };
 
-pub const COUNT: usize = 57;
+pub const COUNT: usize = 73;
 
 const fn sine(level: f32) -> Osc {
     Osc::new(Wave::Sine, level)
@@ -64,6 +66,11 @@ const FX: Preset = Preset {
 const RETRO: Preset = Preset {
     category: Category::Retro,
     reverb: 0.12,
+    ..B
+};
+const CRYSTAL: Preset = Preset {
+    category: Category::Crystal,
+    reverb: 0.5,
     ..B
 };
 const DRUM: Preset = Preset {
@@ -758,8 +765,247 @@ pub static PRESETS: [Preset; COUNT] = [
         pitch_time: 0.06,
         lfo: lfo(Sine, 5.3, ToPitch, 0.04, 0.45),
         reverb: 0.35,
-        gain: 0.41,
+        gain: 0.33,
         ..B
+    },
+    // ----------------------------------------------------------- Crystal
+    Preset {
+        name: "Glass Arp",
+        // Crushed square-wave arpeggio, two octaves, with an echo.
+        osc: [sq(1.0), sq(0.3).oct(1), OFF],
+        amp: adsr(0.001, 0.12, 0.4, 0.08),
+        lfo: lfo(Sine, 6.0, ToPitch, 0.0, 0.4),
+        crush_bits: 6.0,
+        crush_rate: 11_000.0,
+        delay: 0.3,
+        delay_beats: 0.75,
+        delay_feedback: 0.4,
+        reverb: 0.4,
+        arp: arp(ArpPattern::UpOctave, 4, 2, 0.5),
+        gain: 0.32,
+        ..CRYSTAL
+    },
+    Preset {
+        name: "Broken Console",
+        // An 8-bit lead that falls an octave into each note and glitches.
+        osc: [sq(1.0).width(0.25), OFF, OFF],
+        pitch_env: 12.0,
+        pitch_time: 0.18,
+        amp: adsr(0.001, 0.2, 0.75, 0.12),
+        lfo: lfo(Random, 12.0, ToPitch, 0.0, 0.7),
+        crush_bits: 5.0,
+        crush_rate: 9_000.0,
+        drive: 0.3,
+        delay: 0.2,
+        delay_beats: 0.5,
+        reverb: 0.25,
+        gain: 0.43,
+        ..CRYSTAL
+    },
+    Preset {
+        name: "Ghost Choir",
+        // A low, breathy vowel that fades in and drifts.
+        osc: [saw(1.0).oct(-1), OFF, OFF],
+        unison: 3,
+        spread: 18.0,
+        width: 0.8,
+        filter: Filter::formant(600.0, 1.9, 0.7),
+        amp: adsr(0.6, 0.5, 0.9, 2.0),
+        lfo: lfo(Wander, 0.3, ToPitch, 0.08, 0.5),
+        chorus: 0.5,
+        reverb: 0.7,
+        gain: 0.33,
+        ..CRYSTAL
+    },
+    Preset {
+        name: "Static Bloom",
+        // Noise and wide saws that open up slowly, slightly crushed.
+        osc: [saw(0.5), noise(0.5), OFF],
+        unison: 5,
+        spread: 30.0,
+        width: 1.0,
+        filter: Filter::lp(900.0, 0.2).env(2.2),
+        fenv: adsr(2.0, 1.0, 0.7, 2.0),
+        amp: adsr(1.6, 0.5, 1.0, 2.0),
+        lfo: lfo(Wander, 0.4, ToFilter, 0.3, 0.8),
+        crush_bits: 8.0,
+        reverb: 0.7,
+        gain: 0.66,
+        ..CRYSTAL
+    },
+    Preset {
+        name: "Euphoria",
+        // A huge detuned supersaw with an octave on top.
+        osc: [saw(1.0), saw(0.35).oct(1), OFF],
+        unison: 7,
+        spread: 40.0,
+        width: 1.0,
+        filter: Filter::lp(7000.0, 0.15),
+        amp: adsr(0.02, 0.4, 0.9, 0.8),
+        lfo: lfo(Sine, 5.0, ToPitch, 0.0, 0.3),
+        chorus: 0.4,
+        reverb: 0.55,
+        gain: 0.38,
+        ..CRYSTAL
+    },
+    Preset {
+        name: "Drag 808",
+        // A distorted sub bass that slides between notes.
+        osc: [sine(1.0).oct(-1), tri(0.2).oct(-1), OFF],
+        pitch_env: 3.0,
+        pitch_time: 0.05,
+        glide: 0.12,
+        amp: adsr(0.002, 1.2, 0.5, 0.4),
+        lfo: lfo(Sine, 5.0, ToPitch, 0.0, 0.2),
+        drive: 0.55,
+        reverb: 0.05,
+        gain: 0.86,
+        ..CRYSTAL
+    },
+    Preset {
+        name: "Shatter Lead",
+        // A distorted pulse and saw with a long echo.
+        osc: [sq(1.0).width(0.4), saw(0.6).det(12.0), OFF],
+        filter: Filter::lp(5000.0, 0.3),
+        amp: adsr(0.003, 0.3, 0.8, 0.25),
+        lfo: lfo(Sine, 5.5, ToPitch, 0.05, 0.5),
+        drive: 0.8,
+        crush_bits: 7.0,
+        delay: 0.3,
+        delay_beats: 0.75,
+        delay_feedback: 0.45,
+        reverb: 0.35,
+        gain: 0.75,
+        ..CRYSTAL
+    },
+    Preset {
+        name: "Cathedral Drone",
+        // Dark, slowly moving saws in a very large space.
+        osc: [
+            saw(0.7).oct(-1).det(-9.0),
+            saw(0.7).oct(-1).det(9.0),
+            sine(0.6).oct(-2),
+        ],
+        filter: Filter::lp(700.0, 0.25),
+        amp: adsr(2.5, 1.0, 1.0, 4.0),
+        lfo: lfo(Wander, 0.2, ToFilter, 0.5, 1.0),
+        reverb: 0.85,
+        gain: 0.38,
+        ..CRYSTAL
+    },
+    Preset {
+        name: "Tape Bells",
+        // FM bells with a warble, like an old cassette.
+        osc: [sine(1.0), OFF, OFF],
+        fm_ratio: 3.5,
+        fm_index: 3.0,
+        fm_decay: 1.5,
+        amp: adsr(0.001, 1.8, 0.0, 1.5),
+        lfo: lfo(Wander, 1.2, ToPitch, 0.12, 0.4),
+        crush_bits: 10.0,
+        chorus: 0.3,
+        reverb: 0.55,
+        gain: 0.46,
+        ..CRYSTAL
+    },
+    Preset {
+        name: "Witch Pluck",
+        // A dark resonant pluck that echoes into the reverb.
+        osc: [saw(0.8), sq(0.5), OFF],
+        filter: Filter::lp(900.0, 0.6).env(3.0),
+        fenv: adsr(0.001, 0.18, 0.0, 0.2),
+        amp: adsr(0.001, 0.35, 0.0, 0.3),
+        lfo: lfo(Sine, 5.0, ToPitch, 0.0, 0.3),
+        drive: 0.2,
+        delay: 0.35,
+        delay_beats: 0.75,
+        reverb: 0.5,
+        gain: 0.79,
+        ..CRYSTAL
+    },
+    Preset {
+        name: "Siren",
+        // A slow rising and falling howl.
+        osc: [saw(1.0), OFF, OFF],
+        unison: 3,
+        spread: 15.0,
+        width: 0.6,
+        filter: Filter::bp(1500.0, 0.5),
+        amp: adsr(0.2, 0.3, 1.0, 0.8),
+        lfo: lfo(Sine, 0.35, ToPitch, 1.5, 3.0),
+        drive: 0.4,
+        delay: 0.25,
+        reverb: 0.6,
+        gain: 0.43,
+        ..CRYSTAL
+    },
+    Preset {
+        name: "Haunted Organ",
+        // Square and sine drawbars with a shaky tremolo.
+        osc: [sq(0.7), sine(0.5).oct(1), sine(0.6).oct(-1)],
+        filter: Filter::lp(3500.0, 0.1),
+        amp: adsr(0.01, 0.2, 1.0, 0.3),
+        lfo: lfo(Sine, 6.5, ToAmp, 0.25, 0.3),
+        drive: 0.15,
+        chorus: 0.6,
+        reverb: 0.6,
+        gain: 0.36,
+        ..CRYSTAL
+    },
+    // -------------------------------------------------------- 808 drums
+    Preset {
+        name: "808 Boom",
+        osc: [sine(1.0), OFF, OFF],
+        // ~37 Hz body with a long, distorted tail.
+        fixed_note: 26.0,
+        fixed_track: 0.08,
+        pitch_env: 14.0,
+        pitch_time: 0.06,
+        click: 0.15,
+        amp: adsr(0.001, 1.6, 0.0, 0.6),
+        drive: 0.45,
+        reverb: 0.0,
+        gain: 1.33,
+        ..DRUM
+    },
+    Preset {
+        name: "Witch Snare",
+        osc: [tri(0.7).decay(0.1), noise(0.9), OFF],
+        fixed_note: 53.0,
+        fixed_track: 0.1,
+        pitch_env: 5.0,
+        pitch_time: 0.03,
+        filter: Filter::hp(200.0, 0.1),
+        amp: adsr(0.001, 0.35, 0.0, 0.2),
+        drive: 0.25,
+        crush_bits: 9.0,
+        reverb: 0.45,
+        gain: 0.76,
+        ..DRUM
+    },
+    Preset {
+        name: "Trap Hat",
+        osc: [noise(1.0), OFF, OFF],
+        fixed_note: 60.0,
+        fixed_track: 0.1,
+        filter: Filter::hp(8500.0, 0.3).track(1.0),
+        amp: adsr(0.0005, 0.03, 0.0, 0.02),
+        reverb: 0.05,
+        gain: 0.77,
+        ..DRUM
+    },
+    Preset {
+        name: "Haze Clap",
+        osc: [noise(1.0), OFF, OFF],
+        fixed_note: 60.0,
+        fixed_track: 0.1,
+        filter: Filter::bp(1100.0, 0.5).track(1.0),
+        amp: adsr(0.0005, 0.22, 0.0, 0.05),
+        bursts: 3,
+        burst_gap: 0.012,
+        reverb: 0.55,
+        gain: 0.85,
+        ..DRUM
     },
 ];
 
@@ -769,6 +1015,9 @@ pub const DEFAULT_PRESET: usize = 7; // Warm Cloud
 /// The drum voices used by the beat maker, in track order
 /// (Kick, Snare, Hat, Clap).
 pub const BEAT_DRUMS: [&str; 4] = ["Synth Kick", "Snappy Snare", "Hat Tick", "Clap"];
+
+/// The 808 kit for the beat maker, in the same track order.
+pub const BEAT_DRUMS_808: [&str; 4] = ["808 Boom", "Witch Snare", "Trap Hat", "Haze Clap"];
 
 pub fn find(name: &str) -> Option<usize> {
     PRESETS
@@ -782,8 +1031,8 @@ mod tests {
     use crate::preset::Category;
 
     #[test]
-    fn there_are_exactly_57_uniquely_named_sounds() {
-        assert_eq!(PRESETS.len(), 57);
+    fn there_are_exactly_73_uniquely_named_sounds() {
+        assert_eq!(PRESETS.len(), 73);
         for (i, a) in PRESETS.iter().enumerate() {
             assert!(!a.name.is_empty());
             for b in &PRESETS[i + 1..] {
@@ -811,12 +1060,22 @@ mod tests {
     #[test]
     fn defaults_and_beat_drums_exist() {
         assert_eq!(PRESETS[DEFAULT_PRESET].name, "Warm Cloud");
-        for name in BEAT_DRUMS {
+        for name in BEAT_DRUMS.iter().chain(BEAT_DRUMS_808.iter()) {
             let i = find(name).expect(name);
             assert!(PRESETS[i].one_shot);
         }
         for p in PRESETS.iter() {
-            assert_eq!(p.category == Category::Arps, p.arp.is_some(), "{}", p.name);
+            // Arps always arpeggiate; only the Crystal pack may too.
+            assert!(
+                p.category != Category::Arps || p.arp.is_some(),
+                "{}",
+                p.name
+            );
+            assert!(
+                p.arp.is_none() || matches!(p.category, Category::Arps | Category::Crystal),
+                "{}",
+                p.name
+            );
             assert!(p.category != Category::Wind || p.name == "Ocarina");
             assert_eq!(p.category == Category::Drums, p.one_shot, "{}", p.name);
             assert!((1..=7).contains(&p.unison), "{}", p.name);

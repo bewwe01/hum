@@ -29,8 +29,8 @@ const NAMES: [&str; 12] = [
     "settings",
     "play-drums",
     "sheet-key",
-    "songs",
-    "song",
+    "haze",
+    "beat-styles",
 ];
 
 impl Shots {
@@ -151,23 +151,16 @@ fn arrange(app: &mut HumApp, step: usize) {
             app.sheet = Some(Sheet::Key);
         }
         10 => {
-            app.st.play_mode = crate::keyboard::PlayMode::Piano;
-            app.st.songs = vec![crate::songs::Song::from_text(DEMO_SONG)];
-            app.tab = Tab::Songs;
+            app.st.haze = crate::state::Haze::from_amounts(hum_engine::haze::HazeAmounts::HAUNTED);
+            app.haze_open = true;
         }
         _ => {
-            app.tab = Tab::Songs;
-            app.open_song_for_shot();
+            app.haze_open = false;
+            app.tab = Tab::Beats;
+            app.sheet = Some(Sheet::BeatStyle);
         }
     }
 }
-
-/// A made-up chord sheet in the format tab sites use.
-const DEMO_SONG: &str = "Morning Walk\nCapo 2\n\n[Intro]\nG  D  Em  C\n\n[Verse 1]\n\
-G                D\nWoke up early, sun is on the hill\nEm               C\nCoffee on the window sill\n\
-G                D/F#\nEvery street is quiet still\nEm         C        D\nWalking slow, I always will\n\n\
-[Chorus]\nC        G         D       Em\nOh the morning, oh the light\nC        G         D\nEverything is \
-going right\n";
 
 pub fn drive(app: &mut HumApp, ctx: &egui::Context) {
     let Some(mut shots) = app.shots.take() else {

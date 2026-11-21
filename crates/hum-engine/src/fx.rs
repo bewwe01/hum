@@ -214,6 +214,11 @@ impl Reverb {
         }
     }
 
+    /// Tail length: comb feedback (0.86 is the normal room).
+    pub fn set_feedback(&mut self, feedback: f32) {
+        self.feedback = feedback.clamp(0.5, 0.95);
+    }
+
     /// Returns the wet signal for one input frame.
     #[inline]
     pub fn process(&mut self, input: [f32; 2]) -> [f32; 2] {

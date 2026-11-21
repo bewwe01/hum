@@ -39,9 +39,11 @@ impl HumApp {
         // ---- vertical budget ----------------------------------------------
         let knobs_h = 64.0 + 8.0 + 14.0;
         let loop_h = 64.0;
+        let fx_h = 44.0;
         let keys_min = 44.0 + 8.0 + 140.0;
         let pad_h =
-            (rect.bottom() - y - GAP - knobs_h - GAP - loop_h - GAP - keys_min).clamp(110.0, 232.0);
+            (rect.bottom() - y - GAP - knobs_h - GAP - fx_h - 10.0 - loop_h - GAP - keys_min)
+                .clamp(100.0, 232.0);
 
         // ---- XY pad --------------------------------------------------------
         self.xy_pad(
@@ -56,6 +58,13 @@ impl HumApp {
             Rect::from_min_size(pos2(rect.left(), y), vec2(rect.width(), knobs_h)),
         );
         y += knobs_h + GAP;
+
+        // ---- Haze / Drag / Stutter / Tape stop -----------------------------------
+        self.fx_buttons(
+            &p,
+            Rect::from_min_size(pos2(rect.left(), y), vec2(rect.width(), fx_h)),
+        );
+        y += fx_h + 10.0;
 
         // ---- loop bar --------------------------------------------------------
         self.loop_bar(
@@ -174,7 +183,7 @@ impl HumApp {
             ),
         );
         let y = rect.top() + row_h + 10.0;
-        let loop_w = (rect.width() * 0.34).clamp(240.0, 320.0);
+        let loop_w = (rect.width() * 0.4).clamp(240.0, 340.0);
         self.loop_bar(
             &p,
             Rect::from_min_size(pos2(rect.left(), y), vec2(loop_w, 52.0)),
@@ -189,7 +198,12 @@ impl HumApp {
             pos2(switch_right, y + 46.0),
         );
         self.mode_switch(&p, switch);
-        let keys = Rect::from_min_max(pos2(rect.left(), y + 52.0 + 10.0), rect.max);
+        let fx = Rect::from_min_max(pos2(rect.right() - 76.0, y + 52.0 + 10.0), rect.max);
+        self.fx_buttons(&p, fx);
+        let keys = Rect::from_min_max(
+            pos2(rect.left(), y + 52.0 + 10.0),
+            pos2(fx.left() - 10.0, rect.bottom()),
+        );
         self.keyboard(&p, keys, true);
     }
 
@@ -564,6 +578,12 @@ impl HumApp {
                     format!("{bars} bar{}", if bars == 1 { "" } else { "s" }),
                 )
             }
+        };
+        // On a narrow bar the dots take the room; the text gives way.
+        let (line1, line2) = if text_w < 48.0 {
+            (String::new(), String::new())
+        } else {
+            (line1, line2)
         };
         let l1 = theme::fit(p, &line1, inter(14.0, 600), text_w);
         let l2 = theme::fit(p, &line2, inter(12.0, 400), text_w);

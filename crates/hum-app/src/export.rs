@@ -47,12 +47,24 @@ impl HumApp {
             return;
         };
         let steps = looper.steps;
-        let mut cmds = vec![Cmd::SetBpm(self.st.bpm), Cmd::SetLoopSteps(steps)];
+        // The loop is exported as it sounds: with Haze and Drag.
+        let (semis, tempo) = if self.drag_on {
+            self.st.drag.semis_tempo()
+        } else {
+            (0.0, 1.0)
+        };
+        let mut cmds = vec![
+            Cmd::SetDrag { semis, tempo },
+            Cmd::SetBpm(self.st.bpm),
+            Cmd::SetLoopSteps(steps),
+        ];
         for slot in 0..looper.layers.len() {
             cmds.extend(self.layer_cmds(slot));
         }
         cmds.push(Cmd::LoopPlay(true));
-        let loop_seconds = f64::from(steps) / 4.0 * 60.0 / f64::from(self.st.bpm);
+        let loop_seconds =
+            f64::from(steps) / 4.0 * 60.0 / (f64::from(self.st.bpm) * f64::from(tempo));
+        let haze = self.st.haze.amounts();
         let soundfont = self.with_audio(|a| a.soundfont()).flatten();
         let volume = self.st.volume;
         let platform = self.platform.clone();
@@ -64,6 +76,7 @@ impl HumApp {
                 let shared = Arc::new(Shared::default());
                 shared.volume.set(volume);
                 shared.reverb.set(0.0);
+                shared.set_haze(haze);
                 let mut engine = Engine::new(RATE as f32, shared);
                 if let Some(sf) = soundfont {
                     let settings = rustysynth::SynthesizerSettings::new(RATE as i32);
