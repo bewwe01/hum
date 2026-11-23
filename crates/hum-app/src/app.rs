@@ -69,6 +69,10 @@ pub enum Sheet {
     ConfirmClearAll,
     /// Starter beats and swing.
     BeatStyle,
+    /// Piano roll helpers (quantize, chords, loop length...).
+    RollTools,
+    /// Loop length for a first, drawn layer.
+    NewLayer,
     /// Mix settings for one loop layer.
     Layer(usize),
 }
@@ -93,6 +97,8 @@ pub struct HumApp {
     pub(crate) tape_held: bool,
     /// Beats: tapping a step toggles its triplet roll.
     pub(crate) roll_mode: bool,
+    /// The piano roll, when open.
+    pub(crate) roll: Option<crate::screens::RollUi>,
     /// The performance buttons were drawn this frame.
     pub(crate) fx_seen: bool,
     pub(crate) sheet: Option<Sheet>,
@@ -185,6 +191,7 @@ impl HumApp {
             tape_held: false,
             roll_mode: false,
             fx_seen: false,
+            roll: None,
             sheet: None,
             status: status.expect("audio host was just created"),
             now: 0.0,
@@ -568,6 +575,8 @@ impl HumApp {
             self.settings_screen(ui, content);
         } else if self.haze_open {
             self.haze_screen(ui, content);
+        } else if self.roll.is_some() && self.assign_layer.is_none() {
+            self.roll_screen(ui, content);
         } else {
             let (bar, body) = if self.landscape {
                 let bar =
@@ -642,6 +651,8 @@ impl HumApp {
             self.settings_open = false;
         } else if self.haze_open {
             self.haze_open = false;
+        } else if self.roll.is_some() && self.assign_layer.is_none() {
+            self.close_roll();
         } else if self.tab != Tab::Play {
             self.tab = Tab::Play;
         } else {
@@ -820,7 +831,12 @@ impl HumApp {
             Sheet::Scale => 20.0 + 28.0 + 14.0 + 7.0 * 48.0 + 6.0 * 6.0 + 20.0,
             Sheet::ConfirmClearAll => 20.0 + 28.0 + 8.0 + 40.0 + 16.0 + 48.0 + 20.0,
             Sheet::BeatStyle => 20.0 + 28.0 + 14.0 + 3.0 * 64.0 + 4.0 + 56.0 + 20.0,
-            Sheet::Layer(_) => 20.0 + 28.0 + 14.0 + 3.0 * 56.0 + 12.0 + 48.0 + 10.0 + 48.0 + 20.0,
+            Sheet::RollTools => self.roll_tools_height(),
+            Sheet::NewLayer => 20.0 + 28.0 + 8.0 + 40.0 + 16.0 + 48.0 + 20.0,
+            Sheet::Layer(_) if self.landscape => 20.0 + 28.0 + 14.0 + 3.0 * 56.0 + 20.0,
+            Sheet::Layer(_) => {
+                20.0 + 28.0 + 14.0 + 3.0 * 56.0 + 12.0 + 3.0 * 48.0 + 2.0 * 10.0 + 20.0
+            }
         };
         let rect = Rect::from_min_size(
             pos2(
@@ -836,6 +852,8 @@ impl HumApp {
             Sheet::Scale => "Scale",
             Sheet::ConfirmClearAll => "Clear all layers?",
             Sheet::BeatStyle => "Beat styles",
+            Sheet::RollTools => "Tools",
+            Sheet::NewLayer => "Draw a layer",
             Sheet::Layer(_) => "",
         };
         let layer_title;
@@ -865,6 +883,56 @@ impl HumApp {
             Sheet::BeatStyle => {
                 if self.beat_style_sheet(p, inner, top) {
                     close = true;
+                }
+            }
+            Sheet::RollTools => {
+                if self.roll_tools_sheet(p, inner, top) {
+                    close = true;
+                }
+            }
+            Sheet::NewLayer => {
+                widgets::wrapped(
+                    p,
+                    pos2(inner.left(), inner.top() + 36.0),
+                    inner.width(),
+                    "How long should the loop be? You can change it later.",
+                    inter(14.0, 400),
+                    theme::MUTED,
+                );
+                let gap = 8.0;
+                let w = (inner.width() - gap * 3.0) / 4.0;
+                let y = inner.bottom() - 48.0;
+                for (i, bars) in [1u16, 2, 4, 8].into_iter().enumerate() {
+                    let r = Rect::from_min_size(
+                        pos2(inner.left() + i as f32 * (w + gap), y),
+                        vec2(w, 48.0),
+                    );
+                    let tap = self.touches.button(Id::unique(("new-layer-bars", i)), r);
+                    widgets::surface(
+                        p,
+                        r,
+                        24.0,
+                        widgets::pressed(theme::SURFACE_2, tap.down),
+                        theme::LINE,
+                    );
+                    let label = if bars == 1 {
+                        "1 bar".to_owned()
+                    } else {
+                        format!("{bars} bars")
+                    };
+                    theme::text(
+                        p,
+                        r.center(),
+                        Align2::CENTER_CENTER,
+                        &label,
+                        inter(14.0, 600),
+                        theme::TEXT,
+                    );
+                    if tap.clicked {
+                        self.sheet = None;
+                        self.new_roll_layer(bars);
+                        return;
+                    }
                 }
             }
             Sheet::Key => {

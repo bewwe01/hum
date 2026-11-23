@@ -5,5 +5,7 @@ mod haze;
 mod looper;
 pub use looper::layer_color;
 mod play;
+mod roll;
+pub use roll::RollUi;
 mod settings;
 mod sounds;

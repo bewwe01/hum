@@ -169,6 +169,12 @@ impl Touches {
         self.list.iter().filter(move |t| t.owner == Some(owner))
     }
 
+    /// Every touch that started inside `rect`, whoever owns it (for a
+    /// scrolling list whose rows hold buttons).
+    pub fn started_in(&self, rect: Rect) -> impl Iterator<Item = &Touch> + '_ {
+        self.list.iter().filter(move |t| rect.contains(t.start))
+    }
+
     /// Treat `rect` as a push button.
     pub fn button(&mut self, owner: Id, rect: Rect) -> Tap {
         self.claim(owner, rect);

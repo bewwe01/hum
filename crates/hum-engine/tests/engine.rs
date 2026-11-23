@@ -894,3 +894,67 @@ fn stutter_repeats_and_tape_stop_winds_down() {
     assert!(peak(&back[2 * 2_400..]) > 0.01, "the note is back");
     assert_clean(&back, "after tape stop");
 }
+
+#[test]
+fn note_preview_plays_any_sound_briefly() {
+    let mut e = engine();
+    select_dry(&mut e, "Warm Cloud");
+    let bell = presets::find("Tape Bells").unwrap() as u16;
+    e.handle(Cmd::PreviewNote {
+        sound: bell,
+        note: 72,
+        velocity: 100,
+    });
+    let mut out = Vec::new();
+    render(&mut e, 4_800, &mut out);
+    assert_eq!(e.active_voices(), 1);
+    assert!(peak(&out) > 0.01, "the preview sounds");
+    // A new preview cuts the old one; both end on their own.
+    e.handle(Cmd::PreviewNote {
+        sound: bell,
+        note: 76,
+        velocity: 100,
+    });
+    render(&mut e, 48_000 * 6, &mut out);
+    assert_eq!(e.active_voices(), 0);
+}
+
+#[test]
+fn reloading_a_layer_while_it_plays_leaves_nothing_stuck() {
+    let mut e = engine();
+    select_dry(&mut e, "Warm Cloud");
+    e.handle(Cmd::SetBpm(120.0));
+    e.handle(Cmd::SetLoopSteps(16));
+    let sound = presets::find("Warm Cloud").unwrap() as u16;
+    let load = |e: &mut Engine, notes: &[(u8, f32, f32)]| {
+        e.handle(Cmd::BeginLayer {
+            layer: 0,
+            sound,
+            muted: false,
+            volume: 1.0,
+        });
+        for &(note, on, off) in notes {
+            e.handle(Cmd::LoadNote {
+                layer: 0,
+                note,
+                velocity: 100,
+                on,
+                off,
+            });
+        }
+        e.handle(Cmd::EndLayer(0));
+    };
+    load(&mut e, &[(60, 0.0, 12.0)]);
+    e.handle(Cmd::LoopPlay(true));
+    let mut out = Vec::new();
+    render(&mut e, 6_000 * 4, &mut out); // inside the long note
+    assert!(e.active_voices() > 0);
+    // The edit replaces the held note with one later in the bar.
+    load(&mut e, &[(64, 8.0, 9.0)]);
+    render(&mut e, 6_000 * 3, &mut out); // before the new note
+    let mut tail = Vec::new();
+    render(&mut e, 48_000 * 3, &mut tail);
+    e.handle(Cmd::LoopPlay(false));
+    render(&mut e, 48_000 * 8, &mut tail);
+    assert_eq!(e.active_voices(), 0, "nothing hangs after an edit");
+}

@@ -18,7 +18,7 @@ pub struct Shots {
     slot: Arc<Mutex<Option<Arc<egui::ColorImage>>>>,
 }
 
-const NAMES: [&str; 12] = [
+const NAMES: [&str; 14] = [
     "play",
     "play-keys",
     "sounds",
@@ -31,6 +31,8 @@ const NAMES: [&str; 12] = [
     "sheet-key",
     "haze",
     "beat-styles",
+    "roll",
+    "roll-tools",
 ];
 
 impl Shots {
@@ -154,11 +156,17 @@ fn arrange(app: &mut HumApp, step: usize) {
             app.st.haze = crate::state::Haze::from_amounts(hum_engine::haze::HazeAmounts::HAUNTED);
             app.haze_open = true;
         }
-        _ => {
+        11 => {
             app.haze_open = false;
             app.tab = Tab::Beats;
             app.sheet = Some(Sheet::BeatStyle);
         }
+        12 => {
+            app.tab = Tab::Loop;
+            app.open_roll(1);
+            app.send(Cmd::LoopPlay(true));
+        }
+        _ => app.sheet = Some(Sheet::RollTools),
     }
 }
 

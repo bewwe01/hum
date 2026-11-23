@@ -266,16 +266,25 @@ impl HumApp {
                 inter(13.0, 500),
                 theme::MUTED,
             );
+            self.new_layer_row(
+                p,
+                Rect::from_min_size(
+                    pos2(rect.left(), rect.top() + ROW_H + ROW_GAP),
+                    vec2(rect.width(), ROW_H),
+                ),
+                rect,
+            );
             return;
         }
-        // Vertical scrolling when the rows do not fit.
+        // Vertical scrolling when the rows do not fit. Rows hold buttons,
+        // so the list scrolls with any drag that starts on it.
         let id = Id::unique("layer-list");
-        self.touches.claim(id, rect);
-        let content = slots.len() as f32 * (ROW_H + ROW_GAP) - ROW_GAP;
+        let free = slots.len() < LAYERS;
+        let content = (slots.len() + usize::from(free)) as f32 * (ROW_H + ROW_GAP) - ROW_GAP;
         let max_scroll = (content - rect.height()).max(0.0);
         let scroll_id = Id::unique("layer-scroll");
         let mut scroll: f32 = ui.data(|d| d.get_temp(scroll_id)).unwrap_or(0.0);
-        for t in self.touches.owned(id) {
+        for t in self.touches.started_in(rect) {
             if !t.ended && t.travel > crate::input::TAP_SLOP {
                 scroll -= t.delta().y;
             }
@@ -298,6 +307,60 @@ impl HumApp {
                 continue;
             }
             self.layer_row(&clip, row, rect, slot);
+        }
+        if free {
+            let row = Rect::from_min_size(
+                pos2(
+                    rect.left(),
+                    rect.top() - scroll + slots.len() as f32 * (ROW_H + ROW_GAP),
+                ),
+                vec2(rect.width(), ROW_H),
+            );
+            if row.top() < rect.bottom() {
+                self.new_layer_row(&clip, row, rect);
+            }
+        }
+        // Touches in the gaps belong to the list.
+        self.touches.claim(id, rect);
+    }
+
+    /// "+ New layer": draw a layer from scratch in the piano roll.
+    fn new_layer_row(&mut self, p: &Painter, row: Rect, visible: Rect) {
+        let tap = self
+            .touches
+            .button(Id::unique("layer-new"), row.intersect(visible));
+        if tap.down {
+            p.rect_filled(row, 18.0, theme::SURFACE_2);
+        }
+        widgets::dashed_round_rect(p, row, 18.0, Stroke::new(1.0, theme::DASHED_EMPTY));
+        icons::plus(
+            p,
+            pos2(row.left() + 30.0, row.center().y),
+            22.0,
+            theme::VIOLET,
+        );
+        theme::text(
+            p,
+            pos2(row.left() + 52.0, row.center().y - 1.0),
+            Align2::LEFT_BOTTOM,
+            "New layer",
+            inter(14.0, 600),
+            theme::TEXT,
+        );
+        theme::text(
+            p,
+            pos2(row.left() + 52.0, row.center().y + 2.0),
+            Align2::LEFT_TOP,
+            "Draw notes in the piano roll",
+            inter(12.0, 400),
+            theme::MUTED,
+        );
+        if tap.clicked {
+            if self.st.looper.is_some() {
+                self.new_roll_layer(4);
+            } else {
+                self.sheet = Some(Sheet::NewLayer);
+            }
         }
     }
 
@@ -338,6 +401,21 @@ impl HumApp {
         );
         let tidy =
             Rect::from_min_size(pos2(trash.left() - 40.0, row.top() + 6.0), vec2(40.0, 44.0));
+        let edit = Rect::from_min_size(pos2(tidy.left() - 40.0, row.top() + 6.0), vec2(40.0, 44.0));
+        let tap = self
+            .touches
+            .button(Id::unique(("layer-edit", slot)), hit(edit));
+        if tap.down {
+            p.rect_filled(
+                Rect::from_center_size(edit.center(), vec2(34.0, 30.0)),
+                10.0,
+                theme::SURFACE_2,
+            );
+        }
+        icons::roll(p, edit.center(), 20.0, theme::MUTED);
+        if tap.clicked {
+            self.open_roll(slot);
+        }
         let tap = self
             .touches
             .button(Id::unique(("layer-mix", slot)), hit(tidy));
@@ -377,8 +455,8 @@ impl HumApp {
 
         // Volume slider.
         let slider = Rect::from_min_max(
-            pos2(tidy.left() - 76.0, row.top()),
-            pos2(tidy.left() - 6.0, row.bottom()),
+            pos2(edit.left() - 70.0, row.top()),
+            pos2(edit.left() - 4.0, row.bottom()),
         );
         let id = Id::unique(("layer-volume", slot));
         self.touches.claim(id, hit(slider));
@@ -435,7 +513,7 @@ impl HumApp {
         );
         let sound = theme::fit(
             p,
-            &format!("{} ›", layer.sound),
+            &format!("{} ›", self.catalog.get(&layer.sound).name),
             inter(12.0, 400),
             text.width() - 8.0,
         );
@@ -571,9 +649,22 @@ impl HumApp {
         let color = layer_color(slot);
         let mut close = false;
         let mut y = top;
+        // Landscape is short: sliders on the left, buttons on the right.
+        let (sliders, buttons) = if self.landscape {
+            let w = (inner.width() - 20.0) / 2.0;
+            (
+                Rect::from_min_size(inner.min, vec2(w, inner.height())),
+                Rect::from_min_size(
+                    pos2(inner.left() + w + 20.0, inner.top()),
+                    vec2(w, inner.height()),
+                ),
+            )
+        } else {
+            (inner, inner)
+        };
         for i in 0..3usize {
             let label = ["Volume", "Pan", "Reverb"][i];
-            let r = Rect::from_min_size(pos2(inner.left(), y), vec2(inner.width(), 56.0));
+            let r = Rect::from_min_size(pos2(sliders.left(), y), vec2(sliders.width(), 56.0));
             let track =
                 Rect::from_min_max(pos2(r.left(), r.top() + 22.0), pos2(r.right(), r.bottom()));
             let id = Id::unique(("layer-sheet-slider", slot, i));
@@ -635,7 +726,8 @@ impl HumApp {
             p.circle_filled(pos2(xv, cy), 9.0, theme::TEXT);
             y += 56.0;
         }
-        y += 12.0;
+        y = if self.landscape { top } else { y + 12.0 };
+        let inner = buttons;
         let gap = 10.0;
         let w = (inner.width() - gap) / 2.0;
         let sound = Rect::from_min_size(pos2(inner.left(), y), vec2(w, 48.0));
@@ -699,6 +791,30 @@ impl HumApp {
         );
         if tap.clicked {
             self.toggle_tidy(slot);
+        }
+        y += 48.0 + 10.0;
+        let notes = Rect::from_min_size(pos2(inner.left(), y), vec2(inner.width(), 48.0));
+        let tap = self
+            .touches
+            .button(Id::unique(("layer-sheet-notes", slot)), notes);
+        widgets::surface(
+            p,
+            notes,
+            24.0,
+            widgets::pressed(theme::SURFACE_3, tap.down),
+            theme::VIOLET,
+        );
+        theme::text(
+            p,
+            notes.center(),
+            Align2::CENTER_CENTER,
+            "Edit notes in the piano roll",
+            inter(14.0, 600),
+            theme::TEXT,
+        );
+        if tap.clicked {
+            close = true;
+            self.open_roll(slot);
         }
         y += 48.0 + 10.0;
         let delete = Rect::from_min_size(pos2(inner.left(), y), vec2(w, 48.0));

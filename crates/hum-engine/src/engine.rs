@@ -40,7 +40,9 @@ const LEGATO_GLIDE: f32 = 0.07;
 /// SoundFont output level relative to the synth voices.
 const SF_GAIN: f32 = 7.0;
 /// MIDI channels used for SoundFont parts: the live part and 8 layers.
-const SF_CHANNELS: usize = 9;
+/// SoundFont channels: the live part, the loop layers, the drum part
+/// (unused: beats are synth sounds) and the note preview.
+const SF_CHANNELS: usize = PARTS;
 pub const LAYERS: usize = 8;
 /// Maximum number of events (note-ons plus note-offs) in one loop layer.
 pub const LAYER_CAPACITY: usize = 1024;
@@ -63,7 +65,11 @@ const KEY_SLOTS: usize = KEYS + 1;
 const PART_LIVE: u8 = 0;
 const PART_LAYER0: u8 = 1;
 const PART_DRUMS: u8 = PART_LAYER0 + LAYERS as u8;
-const PARTS: usize = PART_DRUMS as usize + 1;
+/// Short note previews (the piano roll), apart from live playing.
+const PART_PREVIEW: u8 = PART_DRUMS + 1;
+const PARTS: usize = PART_PREVIEW as usize + 1;
+/// How long a previewed note sounds.
+const NOTE_PREVIEW_SECONDS: f32 = 0.35;
 
 /// Pad X sweeps the cutoff over this many octaves in total.
 pub const BRIGHT_OCTAVES: f32 = 6.0;
@@ -327,6 +333,13 @@ pub enum Cmd {
     ClearAll,
     /// One note at a time with legato glides (wind instruments).
     SetMono(bool),
+    /// Play `note` briefly in `sound` (any sound), apart from live playing
+    /// and the loop; a new preview cuts the previous one.
+    PreviewNote {
+        sound: SoundId,
+        note: u8,
+        velocity: u8,
+    },
     /// "Drag": everything `semis` lower (may be fractional) and the tempo
     /// times `tempo` (e.g. 0.8). `semis` 0 and `tempo` 1 switch it off.
     SetDrag {
@@ -525,6 +538,9 @@ pub struct Engine {
     mono_velocity: u8,
 
     preview_off: u64,
+    /// The previewed note and the samples until it stops.
+    note_preview: Option<u8>,
+    note_preview_off: u64,
 
     transport: Transport,
     next_step: i64,
@@ -621,6 +637,8 @@ impl Engine {
             mono_current: None,
             mono_velocity: 100,
             preview_off: NEVER,
+            note_preview: None,
+            note_preview_off: NEVER,
             transport: Transport::new(sample_rate),
             next_step: 0,
             beat_on: false,
@@ -765,6 +783,19 @@ impl Engine {
                     self.live_sound = sound;
                     self.update_delay();
                 }
+            }
+            Cmd::PreviewNote {
+                sound,
+                note,
+                velocity,
+            } => {
+                if let Some(old) = self.note_preview.take() {
+                    self.note_off(PART_PREVIEW, old);
+                }
+                let note = note.min(127);
+                self.note_on(PART_PREVIEW, sound, note, velocity.clamp(1, 127));
+                self.note_preview = Some(note);
+                self.note_preview_off = (NOTE_PREVIEW_SECONDS * self.sample_rate) as u64;
             }
             Cmd::Preview { note } => {
                 self.key_up(PREVIEW_KEY);
@@ -1377,7 +1408,9 @@ impl Engine {
             let volume = if ch == 0 {
                 1.0
             } else {
-                self.layers[ch - 1].volume
+                self.layers
+                    .get(ch.wrapping_sub(1))
+                    .map_or(1.0, |l| l.volume)
             };
             let reverb = if m.reverb >= 0.0 { m.reverb } else { 0.3 };
             let wobble = if ch == 0 { m.wobble } else { 0.0 };
@@ -1661,6 +1694,12 @@ impl Engine {
 
     /// Fire everything that is due at the current sample.
     fn run_due(&mut self) {
+        if self.note_preview_off == 0 {
+            self.note_preview_off = NEVER;
+            if let Some(note) = self.note_preview.take() {
+                self.note_off(PART_PREVIEW, note);
+            }
+        }
         if self.preview_off == 0 {
             self.key_up(PREVIEW_KEY);
         }
@@ -1716,7 +1755,11 @@ impl Engine {
 
     /// Samples until the next scheduled event (at least 1).
     fn next_event_distance(&self) -> u64 {
-        let mut d = self.preview_off.min(self.arp.next).min(self.arp.off);
+        let mut d = self
+            .preview_off
+            .min(self.note_preview_off)
+            .min(self.arp.next)
+            .min(self.arp.off);
         for &(wait, _, _) in &self.drum_pending[..self.drum_pending_len] {
             d = d.min(wait);
         }
@@ -1737,7 +1780,12 @@ impl Engine {
 
     fn advance(&mut self, n: usize) {
         let n64 = n as u64;
-        for t in [&mut self.preview_off, &mut self.arp.next, &mut self.arp.off] {
+        for t in [
+            &mut self.preview_off,
+            &mut self.note_preview_off,
+            &mut self.arp.next,
+            &mut self.arp.off,
+        ] {
             if *t != NEVER {
                 *t = t.saturating_sub(n64);
             }

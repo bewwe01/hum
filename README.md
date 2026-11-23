@@ -8,6 +8,12 @@ sound, play. Notes can be locked to a scale, so nothing sounds wrong.
   GS SoundFont, plus Hum's own 73 synth sounds: an Ocarina, the **Crystal**
   pack (12 eerie, broken, euphoric sounds in the witch house mood) and an
   808 drum kit.
+- **Piano roll:** open any loop layer (or start a new one) and draw,
+  move, resize, slice and delete notes, with snap (down to 1/32 and
+  triplets), a velocity lane, the other layers as faint ghost notes, scale
+  or drum-name rows, a chord stamp, quantize, humanize, duplicate,
+  transpose and loop length. Every sound works in it, and the loop keeps
+  playing while you edit.
 - **Haze:** effects on the whole mix: Distortion, Crush (8-bit), Tape
   (wobble, hiss, crackle), Shimmer (a huge reverb that climbs an octave)
   and Pump (the mix ducks on every beat). *Haunted* sets them all at once.
@@ -127,6 +133,10 @@ each module) check:
 - the looper replays recorded notes on the recorded sample, mutes, clears,
   discards empty takes, and keeps each layer's own sound,
 - the arpeggiator walks the scale in time with the shared clock,
+- a previewed note plays in any sound and stops by itself, and editing a
+  layer while the loop plays leaves no note hanging,
+- the piano roll's edits (add, slice, quantize, humanize, duplicate,
+  transpose, chords, loop resizing) do what they say,
 - legato keeps one voice,
 - half-time, swing and triplet rolls put drum hits on the right sample,
 - Drag lowers pitch by the right amount and keeps the user's tempo,

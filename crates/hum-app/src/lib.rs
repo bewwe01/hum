@@ -11,6 +11,7 @@ mod input;
 mod keyboard;
 mod looping;
 mod platform;
+mod roll;
 mod screens;
 mod state;
 mod theme;

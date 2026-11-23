@@ -475,3 +475,22 @@ pub fn download(p: &Painter, c: Pos2, size: f32, color: Color32) {
         color,
     );
 }
+
+/// Note bars on a grid (the piano roll).
+pub fn roll(p: &Painter, c: Pos2, size: f32, color: Color32) {
+    let s = size / 24.0;
+    let r = Rect::from_center_size(c, vec2(18.0 * s, 16.0 * s));
+    p.rect_stroke(r, 3.0 * s, stroke(color), eframe::egui::StrokeKind::Middle);
+    for (x0, x1, y) in [(0.15, 0.55, 0.3), (0.45, 0.85, 0.55), (0.2, 0.5, 0.8)] {
+        let y = r.top() + r.height() * y;
+        polyline(
+            p,
+            &[
+                pos2(r.left() + r.width() * x0, y),
+                pos2(r.left() + r.width() * x1, y),
+            ],
+            2.4 * s,
+            color,
+        );
+    }
+}
